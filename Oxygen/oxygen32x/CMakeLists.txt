@@ -3,6 +3,15 @@ project(oxygen32x_cpu CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+# The CPU cores are interpreters: LTO gives a measurable speed-up.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT O32X_IPO OUTPUT O32X_IPO_MSG LANGUAGES CXX)
+if(O32X_IPO)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
 
 # CPU cores for the Sega 32X: Motorola 68000, Hitachi SH-2 (SH7604) and Zilog Z80.
 # Decoders, shared instruction semantics and reference interpreters.
