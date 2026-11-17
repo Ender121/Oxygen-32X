@@ -20,10 +20,15 @@ int main(int argc, char** argv) {
         if (!f) return 1;
         std::fprintf(f, "P6\n320 224\n255\n");
         const uint8_t* fb = m->mars.fb[m->mars.fb_display];
-        for (int y = 0; y < 224; ++y) for (int x = 0; x < 320; ++x) {
-            uint16_t c = m->mars.pal[fb[(y * 320 + x) ^ 1 & 0x1FFFF]];
-            uint8_t px[3] = { uint8_t((c & 31) << 3), uint8_t(((c >> 5) & 31) << 3), uint8_t(((c >> 10) & 31) << 3) };
-            std::fwrite(px, 1, 3, f);
+        // Packed-pixel mode: a 256-word line table at the start of the buffer
+        // gives each line's word offset; pixels are palette indices (big endian).
+        for (int y = 0; y < 224; ++y) {
+            uint32_t lo = (uint32_t(fb[y * 2]) << 8) | fb[y * 2 + 1];
+            for (int x = 0; x < 320; ++x) {
+                uint16_t c = m->mars.pal[fb[(lo * 2 + x) & 0x1FFFF]];
+                uint8_t px[3] = { uint8_t((c & 31) << 3), uint8_t(((c >> 5) & 31) << 3), uint8_t(((c >> 10) & 31) << 3) };
+                std::fwrite(px, 1, 3, f);
+            }
         }
         std::fclose(f);
     }
