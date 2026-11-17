@@ -1,0 +1,336 @@
+// oxygen32x player: SDL2 front end (video, audio, keyboard / gamepad / touch).
+// Same code for desktop and Android. Usage:
+//   oxygen32x_player <rom.32x> [--frames N] [--shot file.bmp] [--press MASK]
+// On Android the ROM is read from <internal storage>/rom.32x.
+#include "machine/machine.h"
+#include "machine/renderer.h"
+#include <SDL.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace o32x;
+
+namespace {
+
+struct Layout {
+    SDL_Rect game;
+    float r;                 // button radius
+    float dpad_x, dpad_y, dpad_r;
+    float bx[3], by[3];      // A, B, C
+    float start_x, start_y;
+    bool touch_visible;
+};
+
+Layout make_layout(int w, int h) {
+    Layout L{};
+    const bool portrait = h > w;
+    if (portrait) {
+        const int gh = w * 224 / 320;
+        L.game = {0, 0, w, gh};
+        const float area_top = float(gh), area_h = float(h - gh);
+        L.r = std::min(w * 0.08f, area_h * 0.12f);
+        L.dpad_r = L.r * 2.3f;
+        L.dpad_x = L.dpad_r + w * 0.04f;
+        L.dpad_y = area_top + area_h * 0.5f;
+        L.bx[0] = w - L.r * 5.4f; L.by[0] = L.dpad_y + L.r * 1.0f;
+        L.bx[1] = w - L.r * 3.2f; L.by[1] = L.dpad_y - L.r * 0.2f;
+        L.bx[2] = w - L.r * 1.1f; L.by[2] = L.dpad_y - L.r * 1.4f;
+        L.start_x = w * 0.5f;
+        L.start_y = area_top + area_h * 0.9f;
+    } else {
+        int gw = h * 320 / 224;
+        if (gw > w) gw = w;
+        L.game = {(w - gw) / 2, (h - gw * 224 / 320) / 2, gw, gw * 224 / 320};
+        L.r = h * 0.075f;
+        L.dpad_r = L.r * 2.3f;
+        L.dpad_x = L.dpad_r + w * 0.02f;
+        L.dpad_y = h - L.dpad_r - h * 0.04f;
+        L.bx[0] = w - L.r * 5.4f; L.by[0] = h - L.r * 1.8f;
+        L.bx[1] = w - L.r * 3.2f; L.by[1] = h - L.r * 3.0f;
+        L.bx[2] = w - L.r * 1.1f; L.by[2] = h - L.r * 4.2f;
+        L.start_x = w * 0.5f;
+        L.start_y = h - L.r * 0.8f;
+    }
+    L.touch_visible = true;
+    return L;
+}
+
+uint16_t pad_from_touch(const Layout& L, const std::map<SDL_FingerID, SDL_FPoint>& fingers, int w, int h) {
+    uint16_t pad = 0;
+    for (auto& kv : fingers) {
+        const float x = kv.second.x * w, y = kv.second.y * h;
+        // D-pad (generous radius so thumbs can slide)
+        const float dx = x - L.dpad_x, dy = y - L.dpad_y;
+        if (dx * dx + dy * dy < L.dpad_r * L.dpad_r * 1.5f) {
+            const float dead = L.dpad_r * 0.25f;
+            if (dx < -dead) pad |= PAD_LEFT;
+            if (dx > dead) pad |= PAD_RIGHT;
+            if (dy < -dead) pad |= PAD_UP;
+            if (dy > dead) pad |= PAD_DOWN;
+            continue;
+        }
+        static const uint16_t bt[3] = {PAD_A, PAD_B, PAD_C};
+        for (int i = 0; i < 3; ++i) {
+            const float bx = x - L.bx[i], by = y - L.by[i];
+            if (bx * bx + by * by < L.r * L.r * 1.7f) pad |= bt[i];
+        }
+        const float sx = x - L.start_x, sy = y - L.start_y;
+        if (std::fabs(sx) < L.r * 1.6f && std::fabs(sy) < L.r * 0.9f) pad |= PAD_START;
+    }
+    return pad;
+}
+
+void fill_circle(SDL_Renderer* r, float cx, float cy, float rad) {
+    for (int y = int(-rad); y <= int(rad); ++y) {
+        const int half = int(std::sqrt(std::max(0.f, rad * rad - float(y * y))));
+        SDL_RenderDrawLine(r, int(cx) - half, int(cy) + y, int(cx) + half, int(cy) + y);
+    }
+}
+
+void draw_controls(SDL_Renderer* r, const Layout& L, uint16_t pad) {
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    auto col = [&](bool on) { SDL_SetRenderDrawColor(r, on ? 255 : 255, on ? 255 : 255, on ? 255 : 255, on ? 120 : 55); };
+    col(false);
+    fill_circle(r, L.dpad_x, L.dpad_y, L.dpad_r);
+    // direction marks
+    const float a = L.dpad_r * 0.55f, t = L.dpad_r * 0.22f;
+    struct M { uint16_t b; float x, y; } marks[4] = {{PAD_UP, 0, -a}, {PAD_DOWN, 0, a}, {PAD_LEFT, -a, 0}, {PAD_RIGHT, a, 0}};
+    for (auto& m : marks) { col(pad & m.b); fill_circle(r, L.dpad_x + m.x, L.dpad_y + m.y, t); }
+    static const uint16_t bt[3] = {PAD_A, PAD_B, PAD_C};
+    for (int i = 0; i < 3; ++i) { col(pad & bt[i]); fill_circle(r, L.bx[i], L.by[i], L.r); }
+    col(pad & PAD_START);
+    SDL_Rect s{int(L.start_x - L.r * 1.4f), int(L.start_y - L.r * 0.5f), int(L.r * 2.8f), int(L.r)};
+    SDL_RenderFillRect(r, &s);
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+}
+
+uint16_t pad_from_keyboard() {
+    const Uint8* k = SDL_GetKeyboardState(nullptr);
+    uint16_t p = 0;
+    if (k[SDL_SCANCODE_UP]) p |= PAD_UP;
+    if (k[SDL_SCANCODE_DOWN]) p |= PAD_DOWN;
+    if (k[SDL_SCANCODE_LEFT]) p |= PAD_LEFT;
+    if (k[SDL_SCANCODE_RIGHT]) p |= PAD_RIGHT;
+    if (k[SDL_SCANCODE_Z]) p |= PAD_A;
+    if (k[SDL_SCANCODE_X]) p |= PAD_B;
+    if (k[SDL_SCANCODE_C]) p |= PAD_C;
+    if (k[SDL_SCANCODE_A]) p |= PAD_X;
+    if (k[SDL_SCANCODE_S]) p |= PAD_Y;
+    if (k[SDL_SCANCODE_D]) p |= PAD_Z;
+    if (k[SDL_SCANCODE_RETURN]) p |= PAD_START;
+    if (k[SDL_SCANCODE_TAB]) p |= PAD_MODE;
+    return p;
+}
+
+uint16_t pad_from_controller(SDL_GameController* c) {
+    if (!c) return 0;
+    auto b = [&](SDL_GameControllerButton x) { return SDL_GameControllerGetButton(c, x) != 0; };
+    uint16_t p = 0;
+    if (b(SDL_CONTROLLER_BUTTON_DPAD_UP)) p |= PAD_UP;
+    if (b(SDL_CONTROLLER_BUTTON_DPAD_DOWN)) p |= PAD_DOWN;
+    if (b(SDL_CONTROLLER_BUTTON_DPAD_LEFT)) p |= PAD_LEFT;
+    if (b(SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) p |= PAD_RIGHT;
+    if (b(SDL_CONTROLLER_BUTTON_A)) p |= PAD_B;   // south = B (jump in most MD games)
+    if (b(SDL_CONTROLLER_BUTTON_B)) p |= PAD_C;
+    if (b(SDL_CONTROLLER_BUTTON_X)) p |= PAD_A;
+    if (b(SDL_CONTROLLER_BUTTON_Y)) p |= PAD_Y;
+    if (b(SDL_CONTROLLER_BUTTON_START)) p |= PAD_START;
+    if (b(SDL_CONTROLLER_BUTTON_BACK)) p |= PAD_MODE;
+    const int lx = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
+    const int ly = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY);
+    if (lx < -12000) p |= PAD_LEFT;
+    if (lx > 12000) p |= PAD_RIGHT;
+    if (ly < -12000) p |= PAD_UP;
+    if (ly > 12000) p |= PAD_DOWN;
+    return p;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    std::string rom_path, shot_path;
+    int max_frames = -1;
+    uint16_t forced_pad = 0;
+    bool force_touch_ui = false;
+    int win_w = 960, win_h = 672;
+    std::string win_shot;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
+        else if (a == "--shot" && i + 1 < argc) shot_path = argv[++i];
+        else if (a == "--press" && i + 1 < argc) forced_pad = uint16_t(std::strtol(argv[++i], nullptr, 0));
+        else if (a == "--touch-ui") force_touch_ui = true;
+        else if (a == "--size" && i + 1 < argc) std::sscanf(argv[++i], "%dx%d", &win_w, &win_h);
+        else if (a == "--window-shot" && i + 1 < argc) win_shot = argv[++i];
+        else rom_path = a;
+    }
+#ifdef __ANDROID__
+    if (rom_path.empty()) {
+        const char* dir = SDL_AndroidGetInternalStoragePath();
+        rom_path = std::string(dir ? dir : ".") + "/rom.32x";
+    }
+#endif
+    if (rom_path.empty()) { std::fprintf(stderr, "usage: %s rom.32x [--frames N] [--shot out.bmp]\n", argv[0]); return 2; }
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+        std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return 1;
+    }
+    auto machine = std::make_unique<Machine>();
+    std::string err;
+    if (!machine->load_rom(rom_path, &err)) {
+        SDL_Log("ROM error: %s (%s)", err.c_str(), rom_path.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "oxygen32x", err.c_str(), nullptr);
+        SDL_Quit();
+        return 1;
+    }
+    machine->reset();
+    machine->audio_enabled = true;
+
+    SDL_Window* win = SDL_CreateWindow("Oxygen-32X", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h,
+                                       SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!win) { std::fprintf(stderr, "window: %s\n", SDL_GetError()); return 1; }
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    if (!ren) { std::fprintf(stderr, "renderer: %s\n", SDL_GetError()); return 1; }
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kFrameWidth, kFrameMaxHeight);
+
+    // Audio: the machine makes interleaved stereo S16 at ~53.27 kHz; SDL resamples.
+    SDL_AudioSpec want{}, have{};
+    want.freq = 48000; want.format = AUDIO_S16SYS; want.channels = 2; want.samples = 1024;
+    SDL_AudioDeviceID adev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    SDL_AudioStream* stream = nullptr;
+    if (adev) {
+        stream = SDL_NewAudioStream(AUDIO_S16SYS, 2, int(kAudioRate), have.format, have.channels, have.freq);
+        SDL_PauseAudioDevice(adev, 0);
+    }
+    const int bytes_per_sec = adev ? have.freq * have.channels * int(SDL_AUDIO_BITSIZE(have.format) / 8) : 0;
+
+    std::vector<SDL_GameController*> pads;
+    std::map<SDL_FingerID, SDL_FPoint> fingers;
+    bool touch_used = false;
+    auto frame = std::make_unique<Frame>();
+    bool quit = false;
+    int frames = 0;
+    Uint64 next_tick = SDL_GetPerformanceCounter();
+    const double frame_sec = 1.0 / 59.922;
+
+    while (!quit) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            switch (e.type) {
+            case SDL_QUIT: quit = true; break;
+            case SDL_CONTROLLERDEVICEADDED: {
+                SDL_GameController* c = SDL_GameControllerOpen(e.cdevice.which);
+                if (c) pads.push_back(c);
+                break;
+            }
+            case SDL_CONTROLLERDEVICEREMOVED: {
+                for (auto it = pads.begin(); it != pads.end();) {
+                    if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(*it)) == e.cdevice.which) {
+                        SDL_GameControllerClose(*it); it = pads.erase(it);
+                    } else ++it;
+                }
+                break;
+            }
+            case SDL_FINGERDOWN: case SDL_FINGERMOTION:
+                touch_used = true;
+                fingers[e.tfinger.fingerId] = SDL_FPoint{e.tfinger.x, e.tfinger.y};
+                break;
+            case SDL_FINGERUP:
+                fingers.erase(e.tfinger.fingerId);
+                break;
+            case SDL_KEYDOWN:
+                if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_AC_BACK) quit = true;
+                if (e.key.keysym.sym == SDLK_F11) {
+                    Uint32 f = SDL_GetWindowFlags(win);
+                    SDL_SetWindowFullscreen(win, (f & SDL_WINDOW_FULLSCREEN_DESKTOP) ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                }
+                break;
+            default: break;
+            }
+        }
+        int ww, wh;
+        SDL_GetRendererOutputSize(ren, &ww, &wh);
+        const Layout L = make_layout(ww, wh);
+        uint16_t pad = pad_from_keyboard() | forced_pad;
+        for (auto* c : pads) pad |= pad_from_controller(c);
+        const uint16_t touch_pad = pad_from_touch(L, fingers, ww, wh);
+        pad |= touch_pad;
+        machine->input.pad[0] = pad;
+
+        // Run one frame (audio-paced: keep ~3 frames of sound queued).
+        bool run = true;
+        if (stream && adev) {
+            const int queued = int(SDL_GetQueuedAudioSize(adev));
+            run = queued < bytes_per_sec / 60 * 3;
+        }
+        if (run) {
+            machine->run_frame();
+            ++frames;
+            if (stream) {
+                auto& a = machine->audio_out;
+                if (!a.empty()) {
+                    SDL_AudioStreamPut(stream, a.data(), int(a.size() * sizeof(int16_t)));
+                    a.clear();
+                    uint8_t buf[16384];
+                    int got;
+                    while ((got = SDL_AudioStreamGet(stream, buf, sizeof buf)) > 0) SDL_QueueAudio(adev, buf, Uint32(got));
+                }
+            } else {
+                machine->audio_out.clear();
+            }
+            render_frame(*machine, *frame);
+            void* px; int pitch;
+            if (SDL_LockTexture(tex, nullptr, &px, &pitch) == 0) {
+                for (int y = 0; y < frame->height; ++y)
+                    std::memcpy(static_cast<uint8_t*>(px) + y * pitch, frame->pixels + y * kFrameWidth, kFrameWidth * 4);
+                SDL_UnlockTexture(tex);
+            }
+        }
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        SDL_Rect src{0, 0, kFrameWidth, frame->height};
+        SDL_RenderCopy(ren, tex, &src, &L.game);
+        if (force_touch_ui || touch_used || SDL_GetNumTouchDevices() > 0) draw_controls(ren, L, touch_pad);
+        if (!win_shot.empty() && max_frames >= 0 && frames >= max_frames) {
+            SDL_Surface* ws = SDL_CreateRGBSurfaceWithFormat(0, ww, wh, 32, SDL_PIXELFORMAT_ARGB8888);
+            SDL_RenderReadPixels(ren, nullptr, SDL_PIXELFORMAT_ARGB8888, ws->pixels, ws->pitch);
+            SDL_SaveBMP(ws, win_shot.c_str());
+            SDL_FreeSurface(ws);
+        }
+        SDL_RenderPresent(ren);
+
+        if (!stream) {  // no audio device: pace by the clock
+            next_tick += Uint64(frame_sec * double(SDL_GetPerformanceFrequency()));
+            const Uint64 now = SDL_GetPerformanceCounter();
+            if (next_tick > now) SDL_Delay(Uint32(double(next_tick - now) * 1000.0 / double(SDL_GetPerformanceFrequency())));
+            else next_tick = now;
+        } else if (!run) {
+            SDL_Delay(1);
+        }
+        if (max_frames >= 0 && frames >= max_frames) quit = true;
+    }
+    if (!shot_path.empty()) {
+        render_frame(*machine, *frame);
+        SDL_Surface* s = SDL_CreateRGBSurfaceFrom(frame->pixels, frame->width, frame->height, 32, kFrameWidth * 4,
+                                                  0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+        SDL_SaveBMP(s, shot_path.c_str());
+        SDL_FreeSurface(s);
+    }
+    for (auto* c : pads) SDL_GameControllerClose(c);
+    if (stream) SDL_FreeAudioStream(stream);
+    if (adev) SDL_CloseAudioDevice(adev);
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return 0;
+}
