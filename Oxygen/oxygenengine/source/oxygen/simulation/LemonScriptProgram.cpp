@@ -354,8 +354,7 @@ LemonScriptProgram::LoadingResult LemonScriptProgram::loadAllScriptModules(lemon
 			// If base path was not set yet at this point, scripts were likely loaded from a serialization, and we need to take a guess where the original sources are located
 			if (mInternal.mScriptModule.getScriptBasePath().empty())
 			{
-				// TODO: Make this more generic, and especially less specific for S3AIR
-				const std::vector<std::wstring> candidatePaths = { L"./scripts/", L"./bonus/sonic3air_dev/scripts/" };
+				const std::vector<std::wstring> candidatePaths = { L"./scripts/" };
 				for (const std::wstring& candidate : candidatePaths)
 				{
 					if (FTX::FileSystem->exists(candidate + L"main.lemon"))
