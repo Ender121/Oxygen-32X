@@ -1,5 +1,6 @@
 // Headless runner: oxygen32x_run <rom.32x> [frames] [dump.ppm]
 #include "machine/machine.h"
+#include "machine/renderer.h"
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -18,17 +19,13 @@ int main(int argc, char** argv) {
     if (argc > 3) {
         FILE* f = std::fopen(argv[3], "wb");
         if (!f) return 1;
-        std::fprintf(f, "P6\n320 224\n255\n");
-        const uint8_t* fb = m->mars.fb[m->mars.fb_display];
-        // Packed-pixel mode: a 256-word line table at the start of the buffer
-        // gives each line's word offset; pixels are palette indices (big endian).
-        for (int y = 0; y < 224; ++y) {
-            uint32_t lo = (uint32_t(fb[y * 2]) << 8) | fb[y * 2 + 1];
-            for (int x = 0; x < 320; ++x) {
-                uint16_t c = m->mars.pal[fb[(lo * 2 + x) & 0x1FFFF]];
-                uint8_t px[3] = { uint8_t((c & 31) << 3), uint8_t(((c >> 5) & 31) << 3), uint8_t(((c >> 10) & 31) << 3) };
-                std::fwrite(px, 1, 3, f);
-            }
+        auto fr = std::make_unique<o32x::Frame>();
+        o32x::render_frame(*m, *fr);
+        std::fprintf(f, "P6\n%d %d\n255\n", fr->width, fr->height);
+        for (int i = 0; i < fr->width * fr->height; ++i) {
+            uint32_t c = fr->pixels[i];
+            uint8_t px[3] = { uint8_t(c >> 16), uint8_t(c >> 8), uint8_t(c) };
+            std::fwrite(px, 1, 3, f);
         }
         std::fclose(f);
     }

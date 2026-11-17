@@ -24,6 +24,7 @@ add_library(oxygen32x_machine STATIC
     src/machine/log.cpp
     src/machine/rom.cpp
     src/machine/vdp.cpp
+    src/machine/renderer.cpp
     src/machine/machine.cpp
     src/machine/md_bus.cpp
     src/machine/sh2_bus.cpp
