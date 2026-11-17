@@ -1,0 +1,40 @@
+name: oxygen32x Android APK
+
+on:
+  push:
+    branches: [ "32x-*", main ]
+    paths: [ "Oxygen/oxygen32x/**", "framework/external/sdl/**", ".github/workflows/oxygen32x-android.yml" ]
+  workflow_dispatch:
+
+jobs:
+  desktop-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run tests
+        run: |
+          cmake -S Oxygen/oxygen32x -B build -DCMAKE_BUILD_TYPE=Release -DOXYGEN32X_BUILD_PLAYER=OFF
+          cmake --build build -j4
+          ./build/oxygen32x_tests
+
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - name: Install NDK and CMake
+        run: sdkmanager "ndk;26.3.11579264" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build debug APK
+        working-directory: Oxygen/oxygen32x/android
+        run: gradle --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oxygen32x-debug-apk
+          path: Oxygen/oxygen32x/android/app/build/outputs/apk/debug/*.apk
