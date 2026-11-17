@@ -110,6 +110,26 @@ void draw_controls(SDL_Renderer* r, const Layout& L, uint16_t pad) {
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
 }
 
+// Tiny 3x5 font for the fps counter: digits, 'F', 'P', 'S', ' ', '.'
+void draw_text(SDL_Renderer* r, int x, int y, int scale, const std::string& text) {
+    static const char* glyph[] = {
+        "111101101101111", "010110010010111", "111001111100111", "111001111001111", "101101111001001",
+        "111100111001111", "111100111101111", "111001010010010", "111101111101111", "111101111001111",
+    };
+    static const char* gF = "111100110100100"; static const char* gP = "111101111100100";
+    static const char* gS = "111100111001111"; static const char* gDot = "000000000000010";
+    for (char ch : text) {
+        const char* g = nullptr;
+        if (ch >= '0' && ch <= '9') g = glyph[ch - '0'];
+        else if (ch == 'F') g = gF; else if (ch == 'P') g = gP; else if (ch == 'S') g = gS; else if (ch == '.') g = gDot;
+        if (g) for (int i = 0; i < 15; ++i) if (g[i] == '1') {
+            SDL_Rect q{x + (i % 3) * scale, y + (i / 3) * scale, scale, scale};
+            SDL_RenderFillRect(r, &q);
+        }
+        x += 4 * scale;
+    }
+}
+
 uint16_t pad_from_keyboard() {
     const Uint8* k = SDL_GetKeyboardState(nullptr);
     uint16_t p = 0;
@@ -158,6 +178,11 @@ int main(int argc, char** argv) {
     int max_frames = -1;
     uint16_t forced_pad = 0;
     bool force_touch_ui = false;
+#ifdef __ANDROID__
+    bool show_fps = true;   // on until the speed on real devices is known
+#else
+    bool show_fps = false;
+#endif
     int win_w = 960, win_h = 672;
     std::string win_shot;
     for (int i = 1; i < argc; ++i) {
@@ -165,6 +190,7 @@ int main(int argc, char** argv) {
         if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--shot" && i + 1 < argc) shot_path = argv[++i];
         else if (a == "--press" && i + 1 < argc) forced_pad = uint16_t(std::strtol(argv[++i], nullptr, 0));
+        else if (a == "--fps") show_fps = true;
         else if (a == "--touch-ui") force_touch_ui = true;
         else if (a == "--size" && i + 1 < argc) std::sscanf(argv[++i], "%dx%d", &win_w, &win_h);
         else if (a == "--window-shot" && i + 1 < argc) win_shot = argv[++i];
@@ -219,6 +245,10 @@ int main(int argc, char** argv) {
     auto frame = std::make_unique<Frame>();
     bool quit = false;
     int frames = 0;
+    int fps_frames = 0;
+    double fps_value = 0, ms_value = 0;
+    double run_ms_acc = 0;
+    Uint64 fps_t0 = SDL_GetPerformanceCounter();
     Uint64 next_tick = SDL_GetPerformanceCounter();
     const double frame_sec = 1.0 / 59.922;
 
@@ -273,8 +303,11 @@ int main(int argc, char** argv) {
             run = queued < bytes_per_sec / 60 * 3;
         }
         if (run) {
+            const Uint64 t_a = SDL_GetPerformanceCounter();
             machine->run_frame();
+            run_ms_acc += double(SDL_GetPerformanceCounter() - t_a) * 1000.0 / double(SDL_GetPerformanceFrequency());
             ++frames;
+            ++fps_frames;
             if (stream) {
                 auto& a = machine->audio_out;
                 if (!a.empty()) {
@@ -299,6 +332,28 @@ int main(int argc, char** argv) {
         SDL_RenderClear(ren);
         SDL_Rect src{0, 0, kFrameWidth, frame->height};
         SDL_RenderCopy(ren, tex, &src, &L.game);
+        {
+            const Uint64 now = SDL_GetPerformanceCounter();
+            const double dt = double(now - fps_t0) / double(SDL_GetPerformanceFrequency());
+            if (dt >= 1.0) {
+                fps_value = fps_frames / dt;
+                ms_value = fps_frames ? run_ms_acc / fps_frames : 0;
+                fps_frames = 0; run_ms_acc = 0; fps_t0 = now;
+            }
+        }
+        if (show_fps) {
+            // "FPS 60.0" = frames emulated per second; second line: emulation ms per frame (budget 16.7).
+            char b1[32], b2[32];
+            std::snprintf(b1, sizeof b1, "FPS %.1f", fps_value);
+            std::snprintf(b2, sizeof b2, "%.1f", ms_value);
+            const int sc = std::max(2, ww / 160);
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+            SDL_Rect bg{4, 4, 4 * sc * 9, 7 * sc * 2 + 4};
+            SDL_RenderFillRect(ren, &bg);
+            SDL_SetRenderDrawColor(ren, fps_value >= 55 ? 80 : 255, fps_value >= 55 ? 255 : 80, 80, 255);
+            draw_text(ren, 8, 6, sc, b1);
+            draw_text(ren, 8, 6 + 6 * sc, sc, b2);
+        }
         if (force_touch_ui || touch_used || SDL_GetNumTouchDevices() > 0) draw_controls(ren, L, touch_pad);
         if (!win_shot.empty() && max_frames >= 0 && frames >= max_frames) {
             SDL_Surface* ws = SDL_CreateRGBSurfaceWithFormat(0, ww, wh, 32, SDL_PIXELFORMAT_ARGB8888);
