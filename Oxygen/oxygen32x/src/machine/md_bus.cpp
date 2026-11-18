@@ -86,6 +86,8 @@ uint32_t Machine::z80_space_read(uint32_t a) {
 }
 
 void Machine::z80_space_write(uint32_t a, uint32_t v) {
+    ++z80.wcount;  // any writer (the 68K too) invalidates the Z80's idle-loop snapshot
+    z80_flush_debt();
     a &= 0x7FFF;
     if (a < 0x4000) { zram[a & 0x1FFF] = uint8_t(v); return; }
     if (a < 0x6000) { ym.write((a >> 1) & 1, a & 1, uint8_t(v)); return; }
@@ -96,19 +98,22 @@ void Machine::z80_space_write(uint32_t a, uint32_t v) {
 // The Z80's own view of its address space.
 uint8_t Machine::z80_bus_read(uint16_t a) {
     if (a < 0x4000) return zram[a & 0x1FFF];
+    ++z80.unsafe_reads;
     if (a < 0x6000) return ym.read_status();
     if (a < 0x8000) return 0xFF;  // bank register / VDP area
     return uint8_t(m68k_read8(z80_bank | (a & 0x7FFF)));
 }
 
 void Machine::z80_bus_write(uint16_t a, uint8_t v) {
+    ++z80.wcount;
     if (a < 0x8000) { z80_space_write(a, v); return; }
     m68k_write8(z80_bank | (a & 0x7FFF), v);
 }
 
 void Machine::set_z80_reset(bool held) {
     z80_catch_up();
-    if (held && !z80_reset) ym.reset();          // the reset line also resets the YM2612
+    if (held && !z80_reset) ym.reset();
+    z80_flush_debt();          // the reset line also resets the YM2612
     if (!held && z80_reset) z80::reset(&z80);    // released: Z80 restarts at 0
     z80_reset = held ? 1 : 0;
 }

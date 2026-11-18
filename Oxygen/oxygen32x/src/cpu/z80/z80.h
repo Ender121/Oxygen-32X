@@ -26,8 +26,22 @@ struct State {
     uint8_t irq_line;     // /INT level (asserted = 1)
     int32_t cycles;       // remaining T-states in the current slice
     Bus bus;
+    // Idle-loop skipping (run): the bus owner counts the Z80's writes and its reads
+    // of anything that is not plain RAM; a loop that changed neither is idle.
+    uint32_t wcount = 0, unsafe_reads = 0;
+    uint8_t loop_valid = 0;
+    // Set by run(): the CPU is in an idle loop (its last iteration changed nothing
+    // observable), so running it further is invisible until a write, an interrupt
+    // or a bus request.
+    uint8_t idle = 0;
+    uint32_t loop_w = 0, loop_u = 0;
+    int32_t loop_cycles = 0;
+    uint8_t loop_r = 0;
+    uint8_t loop_regs[40];
 };
 
+// Idle-loop skipping (exact; off only for comparisons and tests).
+extern bool g_idle_skip;
 void reset(State* s);
 // Executes one instruction (or an interrupt acknowledge); returns T-states used.
 int step(State* s);

@@ -1,4 +1,6 @@
 #include "z80.h"
+#include <cstddef>
+#include <cstring>
 
 namespace z80 {
 
@@ -546,9 +548,58 @@ int step(State* s) {
     return cpu.exec();
 }
 
+namespace {
+// The architectural state that decides what the next iteration does (R, which
+// only counts instructions, is advanced separately).
+constexpr size_t kRegBytes = offsetof(State, r) - offsetof(State, a);
+inline void save_regs(const State* s, uint8_t* out) {
+    std::memcpy(out, &s->a, kRegBytes);
+    out[kRegBytes] = s->iff1; out[kRegBytes + 1] = s->iff2; out[kRegBytes + 2] = s->im;
+    out[kRegBytes + 3] = s->halted; out[kRegBytes + 4] = s->ei_pending; out[kRegBytes + 5] = s->irq_line;
+}
+static_assert(kRegBytes + 6 <= 40, "loop_regs too small");
+}
+
+bool g_idle_skip = true;
+
 void run(State* s, int32_t cycles) {
+    if (!g_idle_skip) {
+        s->cycles += cycles;
+        while (s->cycles > 0) s->cycles -= step(s);
+        return;
+    }
     s->cycles += cycles;
-    while (s->cycles > 0) s->cycles -= step(s);
+    // The snapshot survives across slices: cycle counts stay comparable.
+    if (s->loop_valid) s->loop_cycles += cycles;
+    bool confirmed = false;
+    while (s->cycles > 0) {
+        const uint16_t pc0 = s->pc;
+        s->cycles -= step(s);
+        if (s->pc > pc0) continue;
+        // A backward jump: if the state is what it was at the last one to this
+        // address and the iteration neither wrote nor read anything that can
+        // change, every further iteration is identical: skip them in one go.
+        uint8_t cur[40];
+        save_regs(s, cur);
+        if (s->loop_valid && std::memcmp(cur, s->loop_regs, kRegBytes + 6) == 0 &&
+            s->loop_w == s->wcount && s->loop_u == s->unsafe_reads && s->loop_cycles > s->cycles) {
+            const int32_t cost = s->loop_cycles - s->cycles;
+            const int32_t n = (s->cycles - 1) / cost;
+            if (n > 0) {
+                s->cycles -= n * cost;
+                s->r = uint8_t((s->r & 0x80) | ((s->r + n * uint8_t(s->r - s->loop_r)) & 0x7F));
+            }
+            confirmed = true;
+            // The state is the snapshot's again: it stays valid for the next jump.
+            s->loop_cycles = s->cycles; s->loop_r = s->r;
+            continue;
+        }
+        confirmed = false;
+        std::memcpy(s->loop_regs, cur, kRegBytes + 6);
+        s->loop_w = s->wcount; s->loop_u = s->unsafe_reads;
+        s->loop_cycles = s->cycles; s->loop_r = s->r; s->loop_valid = 1;
+    }
+    s->idle = confirmed;
 }
 
 } // namespace z80

@@ -85,6 +85,8 @@ void Machine::reset() {
     z80.bus = z80::Bus{this, z80_rd, z80_wr, z80_in, z80_out};
     z80::reset(&z80);
     z80_clock = 0;
+    z80_debt = 0;
+    z80_idle = false;
     ym.reset();
     psg.reset();
     audio_out.clear();
@@ -265,7 +267,24 @@ void Machine::z80_sync(uint64_t now_mclk) {
     // Advanced first: a Z80 write through its bank window that reaches
     // BUSREQ or RESET syncs again, and must find nothing left to run.
     z80_clock = target;
-    if (!z80_reset && !z80_busreq) z80::run(&z80, budget);
+    if (z80_reset || z80_busreq) return;
+    if (z80_idle && z80.irq_line == z80_idle_irq && z80_debt < (1 << 28)) { z80_debt += budget; return; }
+    const int32_t total = z80_debt + budget;
+    z80_debt = 0;
+    z80::run(&z80, total);
+    z80_idle = z80.idle != 0;
+    z80_idle_irq = z80.irq_line;
+}
+
+// Runs the cycles an idle Z80 has been owed (before a write, an interrupt-line
+// change or a bus request could make its position in the loop matter).
+void Machine::z80_flush_debt() {
+    if (z80_debt) {
+        const int32_t d = z80_debt;
+        z80_debt = 0;
+        z80::run(&z80, d);
+    }
+    z80_idle = false;
 }
 
 void Machine::z80_catch_up() {
@@ -276,6 +295,7 @@ void Machine::z80_catch_up() {
 
 void Machine::set_z80_busreq(bool requested) {
     z80_catch_up();
+    z80_flush_debt();
     z80_busreq = requested ? 1 : 0;
 }
 
@@ -324,7 +344,9 @@ void Machine::audio_advance(uint64_t end_mclk) {
 
 void Machine::start_line() {
     vdp.on_line_start(line, kActiveLines);
-    z80.irq_line = line == kActiveLines ? 1 : 0;  // Z80 /INT for one line at V-blank
+    const uint8_t irq = line == kActiveLines ? 1 : 0;
+    if (irq != z80.irq_line) z80_flush_debt();
+    z80.irq_line = irq;  // Z80 /INT for one line at V-blank
     if (line == kActiveLines) {
         // V-blank start: 32X frame buffer swap and V interrupt.
         if (mars.fb_display != mars.fb_select_req) mars.fb_display = mars.fb_select_req;

@@ -14,7 +14,9 @@ int main(int argc, char** argv) {
     std::string err;
     if (!m->load_rom(argv[1], &err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     m->reset();
+    m->audio_enabled = true;
     int frames = argc > 2 ? std::atoi(argv[2]) : 60;
+    if (std::getenv("O32X_NO_Z80SKIP")) z80::g_idle_skip = false;
     const bool recomp = std::getenv("O32X_RECOMP") != nullptr;
     auto rs = o32x::install_recompiled_code(*m, recomp);
     std::printf("exec: %s\n", rs.description.c_str());
@@ -30,6 +32,7 @@ int main(int argc, char** argv) {
             std::printf("f%d %016llx comm0=%04X\n", i + 1, (unsigned long long)h, m->mars.comm[0]);
         }
     }
+    { uint64_t ah = 1469598103934665603ull; for (int16_t v : m->audio_out) ah = (ah ^ uint16_t(v)) * 1099511628211ull; std::printf("audio %zu %016llx\n", m->audio_out.size(), (unsigned long long)ah); }
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("%.1f fps (%.3f ms/frame)\n", frames / secs, 1000 * secs / frames);
     std::printf("frames=%d m68k=%llu msh2=%llu ssh2=%llu comm0=%04X\n", frames,

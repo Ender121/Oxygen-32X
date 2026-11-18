@@ -199,6 +199,12 @@ public:
     uint64_t m68k_clock = 0;  // 68K cycles executed
     uint64_t sh2_clock[2] = {};
     uint64_t z80_clock = 0;
+    // An idle Z80 (z80::State::idle) is not run: its cycles accumulate here and
+    // are run in one go when anything could tell the difference.
+    int32_t z80_debt = 0;
+    bool z80_idle = false;
+    uint8_t z80_idle_irq = 0;
+    void z80_flush_debt();
     int line = 0;
     uint64_t line_start_mclk = 0;
     uint64_t frame_count = 0;
