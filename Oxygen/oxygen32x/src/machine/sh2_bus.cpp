@@ -13,7 +13,21 @@ uint32_t cb_r8(void* u, uint32_t a) { auto* c = static_cast<Sh2BusCtx*>(u); retu
 uint32_t cb_r16(void* u, uint32_t a) { auto* c = static_cast<Sh2BusCtx*>(u); return c->m->sh2_read(c->cpu, a, 2); }
 uint32_t cb_r32(void* u, uint32_t a) { auto* c = static_cast<Sh2BusCtx*>(u); return c->m->sh2_read(c->cpu, a, 4); }
 void cb_w8(void* u, uint32_t a, uint32_t v) { auto* c = static_cast<Sh2BusCtx*>(u); c->m->sh2_write(c->cpu, a, v, 1); }
-void cb_w16(void* u, uint32_t a, uint32_t v) { auto* c = static_cast<Sh2BusCtx*>(u); c->m->sh2_write(c->cpu, a, v, 2); }
+__attribute__((noinline)) void cb_w16_slow(Sh2BusCtx* c, uint32_t a, uint32_t v) { c->m->sh2_write(c->cpu, a, v, 2); }
+void cb_w16(void* u, uint32_t a, uint32_t v) {
+    auto* c = static_cast<Sh2BusCtx*>(u);
+    Machine* m = c->m;
+    // The frame buffer's overwrite image takes nearly all of the 32X drawing
+    // (zero bytes are transparent); same effect as Machine::fb_write. Kept
+    // free of a stack frame: everything else is a tail call.
+    if (__builtin_expect((a >> 29) <= 1 && ((a & 0x1FFFFFFF) >> 17) == 0x04020000u >> 17 && !m->on_fb_write && !(a & 1), 1)) {
+        uint8_t* d = m->mars.fb[m->mars.fb_display ^ 1] + (a & 0x1FFFE);
+        if (v & 0xFF00) d[0] = uint8_t(v >> 8);
+        if (v & 0x00FF) d[1] = uint8_t(v);
+        return;
+    }
+    cb_w16_slow(c, a, v);
+}
 void cb_w32(void* u, uint32_t a, uint32_t v) { auto* c = static_cast<Sh2BusCtx*>(u); c->m->sh2_write(c->cpu, a, v, 4); }
 
 inline uint32_t be_read(const uint8_t* p, int size) {

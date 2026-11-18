@@ -53,6 +53,23 @@ const int kLfoPeriod[8] = {108, 77, 71, 67, 62, 44, 8, 5};
 const double kPmCents[8] = {0, 3.4, 6.7, 10, 14, 20, 40, 80};
 const int kAmShift[4] = {8, 3, 1, 0};
 
+// 2^(cents * tri / 1200) for each PM depth and LFO step, computed once with
+// the same expression the per-sample code used (same doubles, no std::pow in
+// the sample loop).
+const double (*pm_table())[128] {
+    static double t[8][128];
+    static bool init = false;
+    if (!init) {
+        for (int d = 0; d < 8; ++d)
+            for (int p = 0; p < 128; ++p) {
+                const double tri = p < 32 ? p / 32.0 : p < 96 ? (64 - p) / 32.0 : (p - 128) / 32.0;
+                t[d][p] = std::pow(2.0, kPmCents[d] * tri / 1200.0);
+            }
+        init = true;
+    }
+    return t;
+}
+
 inline int keycode(uint16_t fnum, uint8_t block) {
     int n4 = (fnum >> 10) & 1, n3 = (fnum >> 9) & 1, n2 = (fnum >> 8) & 1, n1 = (fnum >> 7) & 1;
     int note = (n4 << 1) | ((n4 & (n3 | n2 | n1)) | ((n4 ^ 1) & n3 & n2 & n1));
@@ -288,12 +305,10 @@ void Ym2612::generate(int samples, std::vector<int16_t>& out) {
     for (int s = 0; s < samples; ++s) {
         // LFO
         int am_val = 0;
-        double pm_tri = 0;
+        const double (*pmt)[128] = pm_table();
         if (lfo_en_) {
             if (++lfo_cnt_ >= kLfoPeriod[lfo_rate_]) { lfo_cnt_ = 0; lfo_step_ = (lfo_step_ + 1) & 127; }
             am_val = lfo_step_ < 64 ? lfo_step_ * 2 : (127 - lfo_step_) * 2;
-            int p = lfo_step_ & 127;  // triangle -1..1 over 128 steps
-            pm_tri = p < 32 ? p / 32.0 : p < 96 ? (64 - p) / 32.0 : (p - 128) / 32.0;
         }
         if (++eg_div_ >= 3) { eg_div_ = 0; step_envelopes(); }
         int32_t left = 0, right = 0;
@@ -302,7 +317,7 @@ void Ym2612::generate(int samples, std::vector<int16_t>& out) {
             int am = kAmShift[ch.ams] >= 8 ? 0 : (am_val >> kAmShift[ch.ams]);
             // Phase advance (with PM applied as a scaled increment).
             if (lfo_en_ && ch.pms) {
-                const double pm = std::pow(2.0, kPmCents[ch.pms] * pm_tri / 1200.0);
+                const double pm = pmt[ch.pms][lfo_step_ & 127];
                 for (auto& op : ch.op) op.phase = (op.phase + uint32_t(op.inc * pm)) & 0xFFFFF;
             } else {
                 for (auto& op : ch.op) op.phase = (op.phase + uint32_t(op.inc)) & 0xFFFFF;

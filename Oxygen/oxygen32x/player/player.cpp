@@ -250,7 +250,9 @@ int main(int argc, char** argv) {
     int frames = 0;
     int fps_frames = 0;
     int skipped = 0;
-    double fps_value = 0, ms_value = 0;
+    double fps_value = 0, ms_value = 0, rms_value = 0, pms_value = 0;
+    double rend_ms_acc = 0, pres_ms_acc = 0;
+    auto ms_since = [](Uint64 t) { return double(SDL_GetPerformanceCounter() - t) * 1000.0 / double(SDL_GetPerformanceFrequency()); };
     double run_ms_acc = 0;
     Uint64 fps_t0 = SDL_GetPerformanceCounter();
     Uint64 next_tick = SDL_GetPerformanceCounter();
@@ -331,6 +333,7 @@ int main(int argc, char** argv) {
                 ++skipped;
             } else {
                 skipped = 0;
+                const Uint64 t_r = SDL_GetPerformanceCounter();
                 render_frame(*machine, *frame);
                 void* px; int pitch;
                 if (SDL_LockTexture(tex, nullptr, &px, &pitch) == 0) {
@@ -338,6 +341,7 @@ int main(int argc, char** argv) {
                         std::memcpy(static_cast<uint8_t*>(px) + y * pitch, frame->pixels + y * kFrameWidth, kFrameWidth * 4);
                     SDL_UnlockTexture(tex);
                 }
+                rend_ms_acc += ms_since(t_r);
             }
         }
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
@@ -350,21 +354,28 @@ int main(int argc, char** argv) {
             if (dt >= 1.0) {
                 fps_value = fps_frames / dt;
                 ms_value = fps_frames ? run_ms_acc / fps_frames : 0;
+                rms_value = fps_frames ? rend_ms_acc / fps_frames : 0;
+                pms_value = fps_frames ? pres_ms_acc / fps_frames : 0;
+                rend_ms_acc = pres_ms_acc = 0;
                 fps_frames = 0; run_ms_acc = 0; fps_t0 = now;
             }
         }
         if (show_fps) {
             // "FPS 60.0" = frames emulated per second; second line: emulation ms per frame (budget 16.7).
-            char b1[32], b2[32];
+            char b1[32], b2[32], b3[32], b4[32];
             std::snprintf(b1, sizeof b1, "FPS %.1f", fps_value);
             std::snprintf(b2, sizeof b2, "%.1f", ms_value);
+            std::snprintf(b3, sizeof b3, "%.1f", rms_value);
+            std::snprintf(b4, sizeof b4, "%.1f", pms_value);
             const int sc = std::max(2, ww / 160);
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-            SDL_Rect bg{4, 4, 4 * sc * 9, 7 * sc * 2 + 4};
+            SDL_Rect bg{4, 4, 4 * sc * 9, 7 * sc * 4 + 4};
             SDL_RenderFillRect(ren, &bg);
             SDL_SetRenderDrawColor(ren, fps_value >= 55 ? 80 : 255, fps_value >= 55 ? 255 : 80, 80, 255);
             draw_text(ren, 8, 6, sc, b1);
             draw_text(ren, 8, 6 + 6 * sc, sc, b2);
+            draw_text(ren, 8, 6 + 12 * sc, sc, b3);
+            draw_text(ren, 8, 6 + 18 * sc, sc, b4);
         }
         if (force_touch_ui || touch_used || SDL_GetNumTouchDevices() > 0) draw_controls(ren, L, touch_pad);
         if (!win_shot.empty() && max_frames >= 0 && frames >= max_frames) {
@@ -373,7 +384,11 @@ int main(int argc, char** argv) {
             SDL_SaveBMP(ws, win_shot.c_str());
             SDL_FreeSurface(ws);
         }
-        SDL_RenderPresent(ren);
+        {
+            const Uint64 t_p = SDL_GetPerformanceCounter();
+            SDL_RenderPresent(ren);
+            pres_ms_acc += ms_since(t_p);
+        }
 
         if (!stream) {  // no audio device: pace by the clock
             next_tick += Uint64(frame_sec * double(SDL_GetPerformanceFrequency()));
