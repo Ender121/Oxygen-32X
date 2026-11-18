@@ -35,9 +35,18 @@ jobs:
         with:
           gradle-version: 8.7
           validate-wrappers: false  # SDL2 ships its own (unused) wrapper jar
+      - name: Recompile the game to C++ (host)
+        run: |
+          # The user's ROM lives in the repo (zip); the generated code is not committed.
+          mkdir -p rom && unzip -o "Chaotix ~ Knuckles Chaotix (Japan USA).zip" -d rom
+          ROM="$(ls rom/*.32x | head -n1)"
+          cmake -S Oxygen/oxygen32x -B hostbuild -DCMAKE_BUILD_TYPE=Release -DOXYGEN32X_BUILD_PLAYER=OFF
+          cmake --build hostbuild --target oxygen32x_recomp -j4
+          COV=""; for f in Oxygen/oxygen32x/coverage/*.cov; do COV="$COV --coverage $f"; done
+          ./hostbuild/oxygen32x_recomp --rom "$ROM" $COV --out "$PWD/generated"
       - name: Build debug APK
         working-directory: Oxygen/oxygen32x/android
-        run: gradle --no-daemon assembleDebug
+        run: gradle --no-daemon assembleDebug -Po32xGenerated="$GITHUB_WORKSPACE/generated"
       - uses: actions/upload-artifact@v4
         with:
           name: oxygen32x-debug-apk

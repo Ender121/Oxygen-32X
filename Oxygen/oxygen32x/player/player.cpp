@@ -3,11 +3,13 @@
 //   oxygen32x_player <rom.32x> [--frames N] [--shot file.bmp] [--press MASK]
 // On Android the ROM is read from <internal storage>/rom.32x.
 #include "machine/machine.h"
+#include "game/recomp_dispatch.h"
 #include "machine/renderer.h"
 #include <SDL.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -217,6 +219,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     machine->reset();
+    { auto rs = install_recompiled_code(*machine, !std::getenv("O32X_NO_RECOMP")); SDL_Log("exec: %s", rs.description.c_str()); }
     machine->audio_enabled = true;
 
     SDL_Window* win = SDL_CreateWindow("Oxygen-32X", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h,

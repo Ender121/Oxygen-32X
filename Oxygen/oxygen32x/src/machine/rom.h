@@ -4,6 +4,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace o32x {
@@ -22,9 +23,17 @@ struct MarsHeader {
     uint32_t slave_vbr = 0;
 };
 
+enum class RomVersion { Unknown, ChaotixJUE };
+
 struct Rom {
     std::vector<uint8_t> data;   // big-endian image, padded to a power of two (at least 4 MiB)
     size_t file_size = 0;
+    std::string sha1;
+    RomVersion version = RomVersion::Unknown;  // ChaotixJUE: the image the recompiled code is made from
+    // No run-time ROM patches here: the image is always the original, and
+    // nothing is listed as changed.
+    std::vector<std::pair<uint32_t, uint32_t>> patched;
+    const std::vector<uint8_t>& unpatched() const { return data; }
     MarsHeader mars;
     uint16_t header_checksum = 0;
     char domestic_name[49] = {};
@@ -37,5 +46,7 @@ struct Rom {
     }
     uint16_t read16(uint32_t off) const { return uint16_t((data[off] << 8) | data[off + 1]); }
 };
+
+std::string sha1_hex(const uint8_t* data, size_t n);
 
 } // namespace o32x

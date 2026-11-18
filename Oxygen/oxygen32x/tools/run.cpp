@@ -1,6 +1,9 @@
 // Headless runner: oxygen32x_run <rom.32x> [frames] [dump.ppm]
 #include "machine/machine.h"
 #include "machine/renderer.h"
+#include "game/recomp_dispatch.h"
+#include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -12,7 +15,23 @@ int main(int argc, char** argv) {
     if (!m->load_rom(argv[1], &err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     m->reset();
     int frames = argc > 2 ? std::atoi(argv[2]) : 60;
-    for (int i = 0; i < frames; ++i) m->run_frame();
+    const bool recomp = std::getenv("O32X_RECOMP") != nullptr;
+    auto rs = o32x::install_recompiled_code(*m, recomp);
+    std::printf("exec: %s\n", rs.description.c_str());
+    const bool hashes = std::getenv("O32X_HASH") != nullptr;
+    auto fr0 = std::make_unique<o32x::Frame>();
+    uint64_t h = 1469598103934665603ull;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < frames; ++i) {
+        m->run_frame();
+        if (hashes && i % 50 == 49) {
+            o32x::render_frame(*m, *fr0);
+            for (int k = 0; k < fr0->width * fr0->height; ++k) h = (h ^ fr0->pixels[k]) * 1099511628211ull;
+            std::printf("f%d %016llx comm0=%04X\n", i + 1, (unsigned long long)h, m->mars.comm[0]);
+        }
+    }
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("%.1f fps (%.3f ms/frame)\n", frames / secs, 1000 * secs / frames);
     std::printf("frames=%d m68k=%llu msh2=%llu ssh2=%llu comm0=%04X\n", frames,
         (unsigned long long)m->stats.m68k_cycles, (unsigned long long)m->stats.msh2_cycles,
         (unsigned long long)m->stats.ssh2_cycles, m->mars.comm[0]);

@@ -16,12 +16,13 @@ android {
         externalNativeBuild {
             cmake {
                 // Always optimised: the CPU cores are interpreters.
-                arguments '-DCMAKE_BUILD_TYPE=Release', '-DANDROID_STL=c++_static'
+                arguments '-DCMAKE_BUILD_TYPE=Release', '-DANDROID_STL=c++_static',
+                        "-DO32X_GENERATED_DIR=${project.findProperty('o32xGenerated') ?: ''}"
                 targets 'main', 'SDL2'
             }
         }
         ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
         }
     }
 

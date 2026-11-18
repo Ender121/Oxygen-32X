@@ -1,6 +1,7 @@
 // SH-2 address space and the 32X system registers (shared with the 68K side).
 // Derived from ChaotixRecompiled (MIT), see LICENSE-ChaotixRecompiled.
 #include "machine/machine.h"
+#include "machine/divide.h"
 #include "machine/log.h"
 #include <cstring>
 
@@ -26,7 +27,62 @@ inline void be_write(uint8_t* p, uint32_t v, int size) {
     p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
 }
 
+// Code ranges [first, second) as one bit per byte of an area of `bytes`.
+std::vector<uint8_t> code_bits(const std::vector<std::pair<uint32_t, uint32_t>>& ranges, uint32_t bytes) {
+    std::vector<uint8_t> bits(bytes / 8, 0);
+    for (const auto& r : ranges)
+        for (uint32_t o = r.first; o < r.second && o < bytes; ++o) bits[o >> 3] |= uint8_t(1u << (o & 7));
+    return bits;
+}
+
+// Whether a write of `size` bytes at `off` touches a code byte.
+inline bool code_hit(const std::vector<uint8_t>& bits, uint32_t off, int size) {
+    for (uint32_t o = off; o < off + uint32_t(size); ++o)
+        if ((o >> 3) < bits.size() && (bits[o >> 3] >> (o & 7) & 1)) return true;
+    return false;
+}
+
+// Whether writing `v` (`size` bytes) at `p` changes what is there.
+inline bool changes(const uint8_t* p, uint32_t v, int size) {
+    const uint32_t mask = size == 4 ? 0xFFFFFFFFu : (1u << (8 * size)) - 1;
+    return be_read(p, size) != (v & mask);
+}
+
 } // namespace
+
+void Machine::code_ranges_changed() {
+    sdram_code_bits = code_bits(sdram_code_ranges, 0x40000);
+    cache_code_bits = code_bits(cache_code_ranges, 0x1000);
+}
+
+void Machine::set_sdram_code_owners(const std::vector<CodeOwner>& owners, size_t functions) {
+    sh2_fn_code_writes.assign(functions, 0);
+    const uint32_t chunks = 0x40000u >> kCodeChunkShift;
+    code_owner_at_.assign(chunks + 1, 0);
+    code_owners_.clear();
+    for (uint32_t k = 0; k < chunks; ++k) {
+        code_owner_at_[k] = uint32_t(code_owners_.size());
+        const uint32_t lo = k << kCodeChunkShift, hi = lo + (1u << kCodeChunkShift);
+        for (const CodeOwner& o : owners)
+            if (o.lo < hi && o.hi > lo && o.fn < functions) code_owners_.push_back(o);
+    }
+    code_owner_at_[chunks] = uint32_t(code_owners_.size());
+}
+
+// A write at SDRAM offset `off` changed a code byte: counts it for every
+// function whose code it overlaps.
+void Machine::sdram_code_written(uint32_t off, int size) {
+    if (code_owner_at_.empty()) return;
+    const uint32_t end = off + uint32_t(size);
+    const uint32_t k0 = off >> kCodeChunkShift, k1 = (end - 1) >> kCodeChunkShift;
+    for (uint32_t k = k0; k <= k1; ++k)
+        for (uint32_t i = code_owner_at_[k]; i < code_owner_at_[k + 1]; ++i) {
+            const CodeOwner& o = code_owners_[i];
+            // Counted once even when a write spans two chunks of one range.
+            if (off < o.hi && end > o.lo && (k == k0 || o.lo >= (k << kCodeChunkShift)))
+                if (++sh2_fn_code_writes[o.fn] == 0) ++sdram_code_epoch;  // wrapped: check everything
+        }
+}
 
 void Machine::remap_sh2() {
     for (int cpu = 0; cpu < 2; ++cpu) {
@@ -37,10 +93,14 @@ void Machine::remap_sh2() {
         b.write8 = cb_w8; b.write16 = cb_w16; b.write32 = cb_w32;
         for (int i = 0; i < sh2::Bus::kPages; ++i) { b.rpage[i] = nullptr; b.wpage[i] = nullptr; }
         const uint32_t pg = 1u << sh2::Bus::kPageShift;
-        // SDRAM 0x06000000-0x0603FFFF
+        // SDRAM 0x06000000-0x0603FFFF. Pages holding recompiled code keep the
+        // slow write path so modifications can invalidate generated code.
         for (uint32_t off = 0; off < 0x40000; off += pg) {
             b.rpage[sh2::page_of(0x06000000 + off)] = sdram + off;
-            b.wpage[sh2::page_of(0x06000000 + off)] = sdram + off;
+            bool watched = false;
+            for (const auto& r : sdram_code_ranges)
+                if (r.first < off + pg && r.second > off) watched = true;
+            if (!watched) b.wpage[sh2::page_of(0x06000000 + off)] = sdram + off;
         }
         // Cartridge ROM 0x02000000-0x023FFFFF
         for (uint32_t off = 0; off < 0x400000; off += pg)
@@ -48,9 +108,10 @@ void Machine::remap_sh2() {
         // The cache data array (area 6), used as RAM.
         uint8_t* cd = onchip[cpu].cache_data;
         b.cache = cd;
-        for (uint32_t off = 0; off < 0x1000; off += 1u << sh2::Bus::kCacheGranuleShift)
-            b.cache_w[off >> sh2::Bus::kCacheGranuleShift] = cd + off;
-        b.code_writes = nullptr;
+        const uint32_t gran = 1u << sh2::Bus::kCacheGranuleShift;
+        for (uint32_t off = 0; off < 0x1000; off += gran)
+            b.cache_w[off >> sh2::Bus::kCacheGranuleShift] = code_hit(cache_code_bits, off, int(gran)) ? nullptr : cd + off;
+        b.code_writes = sh2_fn_code_writes.empty() ? nullptr : sh2_fn_code_writes.data();
     }
 }
 
@@ -450,16 +511,54 @@ void Machine::sh2_write(int cpu, uint32_t a, uint32_t v, int size) {
         uint32_t p = a & 0x1FFFFFFF;
         if (p >= 0x4000 && p < 0x4400) { mars_write(cpu, 0x4000 + (p & 0x3FF), v, size); return; }
         if (p >= 0x04000000 && p < 0x06000000) { fb_write(p & 0x1FFFF, v, size, (p & 0x20000) != 0); return; }
-        if (p >= 0x06000000 && p < 0x08000000) { be_write(sdram + (p & 0x3FFFF), v, size); return; }
+        if (p >= 0x06000000 && p < 0x08000000) {
+            const uint32_t off = p & 0x3FFFF;
+            if (code_hit(sdram_code_bits, off, size) && changes(sdram + off, v, size)) sdram_code_written(off, size);
+            be_write(sdram + off, v, size);
+            return;
+        }
         O32X_LOG_LIMITED(LogLevel::Debug, "sh2", 32, "SH2%c unmapped write%d %08X=%X", cpu ? 'S' : 'M', size * 8, a, v);
         return;
     }
     if (area == 2) return;  // cache purge
     if (area == 3) return;  // cache address array
-    if (area == 6) { be_write(onchip[cpu].cache_data + (a & 0xFFF), v, size); return; }
+    if (area == 6) {
+        const uint32_t off = a & 0xFFF;
+        uint8_t* q = onchip[cpu].cache_data + off;
+        if (code_hit(cache_code_bits, off, size) && changes(q, v, size)) ++cache_code_epoch[cpu];
+        be_write(q, v, size);
+        return;
+    }
     if (a >= 0xFFFFFE00) { onchip_write(cpu, a, v, size); return; }
     if ((a & 0xFFFF0000) == 0xFFFF0000) return;  // SDRAM mode register setup
     O32X_LOG_LIMITED(LogLevel::Debug, "sh2", 32, "SH2%c unmapped write%d %08X=%X", cpu ? 'S' : 'M', size * 8, a, v);
+}
+
+} // namespace o32x
+
+namespace o32x {
+
+int32_t Machine::sh2_read_stable_to(int cpu, uint32_t a, int size, int32_t at) const {
+    // Only the 32X VDP registers, $4100-$41FF: reads have no side effects and
+    // only CPUs write them, so within one CPU's slice only time changes them,
+    // through the status word ($A): HBLK and PEN follow the reader's position
+    // in the line. (Memory and COMM ports are recomp::sh2_pure_load's.)
+    if ((a >> 29) > 1 || !sh2_slice_[cpu].running) return at;
+    const uint32_t p = a & 0x1FFFFFFF;
+    if (p < 0x4100 || p + uint32_t(size) > 0x4200) return at;
+    const bool status_high = (p & 0xF) == 0xA || (size == 4 && (p & 0xE) == 0x8);
+    if (!status_high) return INT32_MIN;
+    const SliceInfo& s = sh2_slice_[cpu];
+    const uint64_t done = s.base + uint64_t(int64_t(s.budget) - at);
+    const int64_t pos = int64_t(done * 7 / 3) - int64_t(line_start_mclk);
+    int64_t edge;
+    if (pos < 0) edge = 0;
+    else if (pos < 2600) edge = 2600;
+    else return INT32_MIN;
+    const uint64_t n = 3 * (line_start_mclk + uint64_t(edge));
+    const uint64_t x_last = div_const<7>(n + 6) - 1;
+    const int64_t c_last = int64_t(s.base) + int64_t(s.budget) - int64_t(x_last);
+    return c_last < int64_t(INT32_MIN) ? INT32_MIN : int32_t(c_last);
 }
 
 } // namespace o32x

@@ -1,0 +1,461 @@
+// SH-2 -> C++ code generation.
+//
+// Delayed branches are emitted in hardware order: the branch target (and PR,
+// or the RTE stack pop) is computed first, then the delay-slot instruction
+// executes, then control transfers. Interrupts are never accepted between a
+// branch and its slot because boundary checks only happen after the pair.
+#include "emit.h"
+#include "runtime/patches.h"
+#include <algorithm>
+#include <cstdarg>
+#include <set>
+
+namespace o32x::recompiler {
+
+using namespace analysis;
+
+namespace {
+
+struct Out {
+    std::string s;
+    void f(const char* fmt, ...) {
+        char buf[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(buf, sizeof buf, fmt, ap);
+        va_end(ap);
+        s += buf;
+    }
+};
+
+std::string insn_init(const sh2::Insn& in) {
+    char b[256];
+    std::snprintf(b, sizeof b, "{0x%08Xu, 0x%04X, static_cast<sh2::Op>(%d), %u, %u, %d, 0x%08Xu, %u, 0x%X}", in.pc, in.opcode, int(in.op),
+                  in.n, in.m, in.imm, in.addr, in.cycles, in.flags);
+    return b;
+}
+
+struct FnCtx {
+    const Program& p;
+    const Function& f;
+    std::set<uint64_t> blockset;
+    bool ram;
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;  // validation ranges (addr, len)
+    std::set<uint32_t> unchecked;  // bytes left out of them: patched immediates
+    bool smc = false;              // in SDRAM: watch for its own code changing
+    std::vector<std::pair<uint32_t, uint32_t>> rom_code;  // see EmitResult::rom_code
+    size_t folded = 0;
+    size_t fast_loops = 0;
+    Out o;
+};
+
+void jump(FnCtx& x, uint32_t t) {
+    uint64_t k = key_of(t, -1);
+    if (x.blockset.count(k)) x.o.f("    goto %s;\n", label(t).c_str());
+    else x.o.f("    return 1;\n");
+}
+
+// Instructions that write memory.
+bool is_store(const sh2::Insn& in) {
+    using sh2::Op;
+    switch (in.op) {
+    case Op::MOVB_S: case Op::MOVW_S: case Op::MOVL_S: case Op::MOVB_M: case Op::MOVW_M: case Op::MOVL_M:
+    case Op::MOVB_S0: case Op::MOVW_S0: case Op::MOVL_S0: case Op::MOVB_S4: case Op::MOVW_S4: case Op::MOVL_S4:
+    case Op::MOVB_SG: case Op::MOVW_SG: case Op::MOVL_SG: case Op::AND_B: case Op::OR_B: case Op::XOR_B: case Op::TAS:
+    case Op::STCL_GBR: case Op::STCL_SR: case Op::STCL_VBR: case Op::STSL_MACH: case Op::STSL_MACL: case Op::STSL_PR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// SDRAM, where most SH-2 code runs from a copy of the ROM.
+bool in_sdram(uint32_t a) {
+    const uint32_t p = a & 0x1FFFFFFF;
+    return (a >> 29) <= 1 && p >= 0x06000000 && p < 0x06040000;
+}
+
+// An ADD #imm or MOV #imm in SDRAM whose immediate the runtime patches.
+bool patched_immediate(const FnCtx& x, const sh2::Insn& in) {
+    if (!x.ram || (in.op != sh2::Op::ADD_I && in.op != sh2::Op::MOV_I)) return false;
+    return in_sdram(in.pc) && patches::is_patched_sh2_immediate(in.pc & 0x3FFFF);
+}
+
+// A record-only host hook runs before this instruction (patches.h,
+// kSh2Hooks): it belongs to the SDRAM routine at that address.
+bool sh2_hook_at(const FnCtx& x, uint32_t pc) {
+    return x.ram && in_sdram(pc) && patches::is_sh2_hook(pc);
+}
+
+// Emits the semantics of a non-branch instruction. Literal-pool loads from
+// ROM-derived memory are folded into constants -- except in SDRAM, where a
+// "literal" can be a variable: the special stage keeps values in words after
+// its code, writes them through MOVA and reads them back PC-relative (issue
+// #31). Folded, native code read the ROM's value after the game had changed
+// it. Those are read as they run, and left out of the validated code.
+void emit_simple(FnCtx& x, const sh2::Insn& in, const char* indent) {
+    if ((in.op == sh2::Op::MOVL_PC || in.op == sh2::Op::MOVW_PC) && x.ram && in_sdram(in.addr)) {
+        if (in.op == sh2::Op::MOVL_PC)
+            x.o.f("%sc->r[%u] = ::recomp::sh2_code32(c, 0x%08Xu);  // variable @%08X\n", indent, in.n, in.addr, in.addr);
+        else
+            x.o.f("%sc->r[%u] = uint32_t(int32_t(int16_t(::recomp::sh2_code16(c, 0x%08Xu))));  // variable @%08X\n", indent,
+                  in.n, in.addr, in.addr);
+        return;
+    }
+    if (in.op == sh2::Op::MOVL_PC || in.op == sh2::Op::MOVW_PC) {
+        int sp = x.p.space_of(in.addr, -1);
+        if (sp >= 0) {
+            bool ok = true;
+            uint32_t v;
+            if (in.op == sh2::Op::MOVL_PC) v = x.p.fetch32(in.addr, -1, &ok);
+            else { uint16_t h = 0; ok = x.p.fetch16(in.addr, -1, h); v = uint32_t(int32_t(int16_t(h))); }
+            if (ok) {
+                x.o.f("%sc->r[%u] = 0x%08Xu;  // literal @%08X\n", indent, in.n, v, in.addr);
+                if (x.p.spaces[size_t(sp)].ram) x.ranges.push_back({in.addr, in.op == sh2::Op::MOVL_PC ? 4u : 2u});
+                else x.rom_code.push_back({x.p.spaces[size_t(sp)].to_rom(in.addr), in.op == sh2::Op::MOVL_PC ? 4u : 2u});
+                ++x.folded;
+                return;
+            }
+        }
+    }
+    if (in.op == sh2::Op::NOP) { x.o.f("%s/* nop */\n", indent); return; }
+    if (patched_immediate(x, in)) {
+        // The runtime rewrites this immediate (patches.h): read it as it runs.
+        x.o.f("%s{ sh2::Insn I = %s; I.imm = int8_t(recomp::sh2_code_byte(c, 0x%08Xu)); sh2::exec_simple(c, I); }\n",
+              indent, insn_init(in).c_str(), in.pc + 1);
+        x.unchecked.insert(in.pc + 1);
+        return;
+    }
+    x.o.f("%s{ [[maybe_unused]] static constexpr sh2::Insn I = %s; sh2::exec_simple(c, I); }\n", indent, insn_init(in).c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Self-loop recognition (idle-time fast-forward)
+//
+// Inside one SH-2 time slice nothing else in the machine changes state, so a
+// loop whose iterations leave the machine in the same state can be skipped
+// to the end of the slice with an exact cycle count. The interpreter still
+// executes every iteration; lockstep validation proves equivalence.
+// ---------------------------------------------------------------------------
+struct SelfLoop {
+    enum Kind { NONE, DELAY, POLL } kind = NONE;
+    int reg = 0;   // DELAY: counter register
+    int cost = 0;  // POLL: cycles per iteration
+    struct Load {
+        std::string addr;  // address expression
+        int size;          // bytes
+        int at;            // cycles from the iteration's start to the read, inclusive
+    };
+    std::vector<Load> loads;  // POLL: the reads, checked at run time (recomp_api.h)
+};
+
+constexpr uint32_t kRegT = 1u << 16, kRegGbr = 1u << 17;
+
+// Register effects of instructions allowed in a polling loop. Returns false
+// for anything else (stores, branches, MAC, SR changes, ...).
+bool poll_op(const Program& p, const sh2::Insn& in, uint32_t& rd, uint32_t& wr, uint32_t& addr_regs, std::string& addr) {
+    using sh2::Op;
+    const uint32_t N = 1u << in.n, M = 1u << in.m, R0 = 1u;
+    char b[96];
+    rd = wr = addr_regs = 0;
+    addr.clear();
+    switch (in.op) {
+    case Op::MOVL_PC: case Op::MOVW_PC:
+        wr = N;
+        if (p.space_of(in.addr, -1) < 0) { std::snprintf(b, sizeof b, "0x%08Xu", in.addr); addr = b; }
+        return true;
+    case Op::MOV_I: wr = N; return true;
+    case Op::MOV: rd = M; wr = N; return true;
+    case Op::MOVB_L: case Op::MOVW_L: case Op::MOVL_L:
+        rd = addr_regs = M; wr = N; std::snprintf(b, sizeof b, "c->r[%u]", in.m); addr = b; return true;
+    case Op::MOVL_L4:
+        rd = addr_regs = M; wr = N; std::snprintf(b, sizeof b, "c->r[%u] + %du", in.m, in.imm); addr = b; return true;
+    case Op::MOVB_L4: case Op::MOVW_L4:
+        rd = addr_regs = M; wr = R0; std::snprintf(b, sizeof b, "c->r[%u] + %du", in.m, in.imm); addr = b; return true;
+    case Op::MOVB_L0: case Op::MOVW_L0: case Op::MOVL_L0:
+        rd = addr_regs = M | R0; wr = N; std::snprintf(b, sizeof b, "c->r[%u] + c->r[0]", in.m); addr = b; return true;
+    case Op::MOVB_LG: case Op::MOVW_LG: case Op::MOVL_LG:
+        rd = addr_regs = kRegGbr; wr = R0; std::snprintf(b, sizeof b, "c->gbr + %du", in.imm); addr = b; return true;
+    case Op::TST_B:
+        rd = addr_regs = kRegGbr | R0; wr = kRegT; addr = "c->gbr + c->r[0]"; return true;
+    case Op::TST: case Op::CMP_EQ: case Op::CMP_HS: case Op::CMP_GE: case Op::CMP_HI: case Op::CMP_GT: case Op::CMP_STR:
+        rd = N | M; wr = kRegT; return true;
+    case Op::TST_I: case Op::CMP_EQ_I: rd = R0; wr = kRegT; return true;
+    case Op::CMP_PZ: case Op::CMP_PL: rd = N; wr = kRegT; return true;
+    case Op::EXTU_B: case Op::EXTU_W: case Op::EXTS_B: case Op::EXTS_W: case Op::SWAP_B: case Op::SWAP_W: case Op::NOT:
+        rd = M; wr = N; return true;
+    case Op::AND: case Op::OR: case Op::XOR: rd = N | M; wr = N; return true;
+    case Op::AND_I: case Op::OR_I: case Op::XOR_I: rd = R0; wr = R0; return true;
+    case Op::SHLL2: case Op::SHLL8: case Op::SHLL16: case Op::SHLR2: case Op::SHLR8: case Op::SHLR16: rd = N; wr = N; return true;
+    case Op::NOP: return true;
+    default: return false;
+    }
+}
+
+// The size of a polling loop's read (one poll_op gave an address).
+int load_size(const sh2::Insn& in) {
+    using sh2::Op;
+    switch (in.op) {
+    case Op::MOVB_L: case Op::MOVB_L4: case Op::MOVB_L0: case Op::MOVB_LG: case Op::TST_B: return 1;
+    case Op::MOVW_L: case Op::MOVW_L4: case Op::MOVW_L0: case Op::MOVW_LG: case Op::MOVW_PC: return 2;
+    default: return 4;
+    }
+}
+
+SelfLoop analyze_self_loop(const Program& p, const Block& b) {
+    SelfLoop L;
+    if (b.insns.size() < 2) return L;
+    sh2::Insn last;
+    p.decode_sh2(b.insns.back(), last);
+    if (!(last.op == sh2::Op::BT || last.op == sh2::Op::BF) || last.addr != b.start) return L;
+    if (b.insns.size() == 2) {
+        sh2::Insn d;
+        p.decode_sh2(b.insns[0], d);
+        if (d.op == sh2::Op::DT && last.op == sh2::Op::BF) { L.kind = SelfLoop::DELAY; L.reg = d.n; return L; }
+    }
+    // Poll loop: no loop-carried state (every register/T read before being
+    // written in the iteration must not be written anywhere in the loop).
+    std::vector<sh2::Insn> body(b.insns.size() - 1);
+    uint32_t all_wr = 0;
+    std::vector<uint32_t> rds, wrs, ars;
+    std::vector<SelfLoop::Load> loads;
+    int at = 0;
+    for (size_t i = 0; i + 1 < b.insns.size(); ++i) {
+        p.decode_sh2(b.insns[i], body[i]);
+        uint32_t rd, wr, ar;
+        std::string ex;
+        if (!poll_op(p, body[i], rd, wr, ar, ex)) return L;
+        rds.push_back(rd); wrs.push_back(wr); ars.push_back(ar);
+        all_wr |= wr;
+        at += body[i].cycles;  // the read is made after its instruction's cycles are charged
+        if (!ex.empty()) loads.push_back({ex, load_size(body[i]), at});
+    }
+    const int cost = at + int(last.cycles);
+    uint32_t written = 0;
+    for (size_t i = 0; i < body.size(); ++i) {
+        if (rds[i] & ~written & all_wr) return L;          // loop-carried value
+        uint32_t later = 0;
+        for (size_t j = i; j < body.size(); ++j) later |= wrs[j];
+        if (ars[i] & later) return L;                      // address register changes after the load
+        written |= wrs[i];
+    }
+    if (!(written & kRegT)) return L;                      // the branch must test a fresh T
+    L.kind = SelfLoop::POLL;
+    L.cost = cost;
+    L.loads = std::move(loads);
+    return L;
+}
+
+void emit_branch(FnCtx& x, const sh2::Insn& in, const SelfLoop* loop = nullptr) {
+    Out& o = x.o;
+    o.f("  { [[maybe_unused]] static constexpr sh2::Insn I = %s;\n", insn_init(in).c_str());
+    o.f("    c->cycles -= %u;\n", in.cycles);
+    o.f("    uint32_t t_ = sh2::branch_target(c, I);\n");
+    if (in.op == sh2::Op::BT || in.op == sh2::Op::BF || in.op == sh2::Op::BT_S || in.op == sh2::Op::BF_S)
+        o.f("    c->cycles += sh2::branch_cycle_adjust(I, t_);\n");
+    if (in.flags & sh2::IF_DELAYED) {
+        sh2::Insn slot;
+        x.p.decode_sh2(in.pc + 2, slot);
+        o.f("    // slot %08X: %s\n", slot.pc, sh2::disassemble(slot).c_str());
+        o.f("    c->cycles -= %u;\n", slot.cycles);
+        emit_simple(x, slot, "    ");
+    }
+    o.f("    c->pc = t_; SH2_BOUNDARY();\n");
+    if (x.smc && (in.flags & sh2::IF_DELAYED)) {
+        sh2::Insn slot;
+        x.p.decode_sh2(in.pc + 2, slot);
+        if (is_store(slot)) o.f("    SH2_CODE_CHANGED_AT_BOUNDARY();\n");
+    }
+    using sh2::Op;
+    switch (in.op) {
+    case Op::BRA:
+        jump(x, in.addr);
+        break;
+    case Op::BT: case Op::BF: case Op::BT_S: case Op::BF_S: {
+        uint32_t fall = in.pc + ((in.flags & sh2::IF_DELAYED) ? 4 : 2);
+        o.f("    if (t_ == 0x%08Xu) {\n", in.addr);
+        if (loop && loop->kind == SelfLoop::POLL) {
+            // Polling loop without loop-carried state: an iteration that reads
+            // what this one read takes the branch again and leaves the same
+            // registers, so it only costs its cycles. Charge at once the
+            // iterations up to the slice end (n_), or up to the first read that
+            // may differ (recomp_api.h, sh2_poll_repeats): that one runs.
+            o.f("      if (::recomp::g_idle_skip) {\n");
+            o.f("        const int32_t n_ = (c->cycles + %d) / %d;\n", loop->cost - 1, loop->cost);
+            o.f("        int32_t k_ = n_;\n");
+            for (const auto& l : loop->loads)
+                o.f("        { const int32_t r_ = ::recomp::sh2_poll_repeats(c, %s, %d, c->cycles + %d, %d); if (r_ < k_) k_ = r_; }\n",
+                    l.addr.c_str(), l.size, loop->cost - l.at, loop->cost);
+            o.f("        c->cycles -= k_ * %d; ::recomp::g_idle_skipped[1 + c->id] += uint64_t(k_) * %du;\n", loop->cost, loop->cost);
+            o.f("        if (k_ == n_) return 0;\n");
+            o.f("      }\n");
+            ++x.fast_loops;
+        }
+        jump(x, in.addr);
+        o.f("    }\n");
+        jump(x, fall);
+        break;
+    }
+    case Op::BSR: case Op::JSR: case Op::BSRF: {
+        uint32_t ret = in.pc + 4;
+        std::string callee;
+        if (in.op == Op::BSR && x.p.functions.count(key_of(in.addr, -1))) callee = fn_name(Cpu::SH2, key_of(in.addr, -1));
+        o.f("    {\n");
+        if (!callee.empty()) {
+            // A direct call skips the dispatcher, and with it the check that
+            // the callee's code in RAM is still what it was compiled from (the
+            // special stage rewrites its own code; issue #31). Check it here,
+            // remembering which function it is.
+            const Function& cf = x.p.functions.at(key_of(in.addr, -1));
+            if (cf.space >= 0 && x.p.spaces[size_t(cf.space)].ram)
+                o.f("      static uint32_t fi_ = 0; if (!::recomp::sh2_callee_valid(c, &fi_)) return 1;\n");
+            o.f("      if (::recomp::g_depth >= ::recomp::kMaxDepth) return 1;\n");
+            o.f("      ++::recomp::g_depth; int r_ = %s(c); --::recomp::g_depth;\n", callee.c_str());
+        } else {
+            o.f("      int r_ = ::recomp::sh2_call_dynamic(c);\n");
+        }
+        o.f("      if (!r_ || c->pc != 0x%08Xu) return r_;\n    }\n", ret);
+        if (x.smc) o.f("    SH2_CODE_CHANGED_AT_BOUNDARY();\n");
+        jump(x, ret);
+        break;
+    }
+    default:  // RTS, RTE, JMP, BRAF, TRAPA, invalid: dynamic target
+        o.f("    return 1;\n");
+        break;
+    }
+    o.f("  }\n");
+}
+
+} // namespace
+
+void emit_sh2(const Program& p, const EmitOptions& opt, EmitResult& out) {
+    auto owner = block_owner(p);
+    std::vector<uint64_t> fkeys;
+    for (const auto& [k, f] : p.functions) fkeys.push_back(k);
+    for (const auto& [k, f] : p.functions) out.decls.push_back("int " + fn_name(Cpu::SH2, k) + "(sh2::State* c);");
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> fn_ranges;  // function -> (begin, count)
+
+    const size_t per_file = (fkeys.size() + kSh2Shards - 1) / kSh2Shards;
+    for (size_t file_index = 0; file_index < kSh2Shards; ++file_index) {
+        const size_t start = file_index * per_file;
+        char fname[64];
+        std::snprintf(fname, sizeof fname, "recomp_sh2_%03zu.cpp", file_index);
+        std::string body;
+        body += "// Generated by oxygen32x_recomp from the user's ROM. Do not edit; do not commit.\n";
+        body += "#include \"recomp_decls.h\"\n\nnamespace recomp {\n\n";
+        for (size_t i = start; i < fkeys.size() && i < start + per_file; ++i) {
+            const Function& f = p.functions.at(fkeys[i]);
+            bool ram = f.space >= 0 && p.spaces[size_t(f.space)].ram;
+            FnCtx x{p, f, std::set<uint64_t>(f.blocks.begin(), f.blocks.end()), ram, {}, {}, false, {}, 0, 0, {}};
+            x.o.f("int %s(sh2::State* c) {\n", fn_name(Cpu::SH2, f.entry).c_str());
+            // Self-modifying code (the special stage rewrites immediates in
+            // its own routines, e.g. the ADD at $06005A64): native code was
+            // validated on entry and kept running what it was compiled from.
+            // After anything that may have written code -- a store, a call --
+            // it now checks whether its own code changed (the count of writes
+            // over it, Machine::sdram_code_written) and, if so, hands
+            // over to the interpreter at the same boundary the interpreter
+            // would reach, so lockstep holds.
+            x.smc = ram && in_sdram(key_addr(f.entry));
+            if (x.smc)
+                x.o.f("  constexpr uint32_t fn_ = %zuu;\n  [[maybe_unused]] const uint32_t e0_ = c->bus.code_writes[fn_];\n", i);
+            x.o.f("  switch (c->pc) {\n");
+            for (uint64_t b : f.blocks) x.o.f("  case 0x%08Xu: goto %s;\n", key_addr(b), label(key_addr(b)).c_str());
+            x.o.f("  default: return 1;\n  }\n");
+            for (uint64_t bk : f.blocks) {
+                const Block& b = p.blocks.at(bk);
+                if (ram) x.ranges.push_back({b.start, b.end - b.start});
+                else if (f.space >= 0 && b.end > b.start)
+                    x.rom_code.push_back({p.spaces[size_t(f.space)].to_rom(b.start), b.end - b.start});
+                x.o.f("%s:\n", label(b.start).c_str());
+                // A record-only hook (patches.h, kSh2Hooks) runs before its
+                // instruction in the interpreter, every time; a loop skipped
+                // in closed form would call it fewer times.
+                bool hooked = false;
+                for (uint32_t a : b.insns) hooked = hooked || sh2_hook_at(x, a);
+                const SelfLoop loop = hooked ? SelfLoop{} : analyze_self_loop(p, b);
+                if (loop.kind == SelfLoop::DELAY) {
+                    // Counted delay loop `dt rN ; bf self` (4 cycles per taken
+                    // iteration): skip whole iterations in closed form, stopping
+                    // exactly where the interpreter's slice would end.
+                    x.o.f("  { uint32_t r_ = c->r[%d];\n", loop.reg);
+                    x.o.f("    if (::recomp::g_idle_skip && r_ > 1 && c->cycles > 0 && !(c->irq_level > ((c->sr >> 4) & 15))) {\n");
+                    x.o.f("      uint32_t can_ = (uint32_t(c->cycles) + 3u) / 4u, k_ = r_ - 1 < can_ ? r_ - 1 : can_;\n");
+                    x.o.f("      c->r[%d] = r_ - k_; c->cycles -= int32_t(4u * k_); c->sr &= ~sh2::SR_T;\n", loop.reg);
+                    x.o.f("      ::recomp::g_idle_skipped[1 + c->id] += 4u * k_;\n");
+                    x.o.f("      if (k_ == can_) { c->pc = 0x%08Xu; return 0; }\n    } }\n", b.start);
+                    ++x.fast_loops;
+                }
+                for (size_t n = 0; n < b.insns.size(); ++n) {
+                    sh2::Insn in;
+                    p.decode_sh2(b.insns[n], in);
+                    ++out.instructions;
+                    x.o.f("  // %08X: %s\n", in.pc, sh2::disassemble(in).c_str());
+                    if (sh2_hook_at(x, in.pc)) x.o.f("  if (c->hook) c->hook(c, 0x%08Xu);\n", in.pc);
+                    if (in.flags & sh2::IF_BRANCH) { emit_branch(x, in, n + 1 == b.insns.size() ? &loop : nullptr); continue; }
+                    x.o.f("  c->cycles -= %u;\n", in.cycles);
+                    if (sh2::ends_block(in)) {
+                        x.o.f("  c->pc = 0x%08Xu;\n", in.pc + 2);
+                        emit_simple(x, in, "  ");
+                        x.o.f("  SH2_BOUNDARY();\n");
+                        jump(x, in.pc + 2);
+                        continue;
+                    }
+                    emit_simple(x, in, "  ");
+                    if (x.smc && is_store(in)) x.o.f("  SH2_CODE_CHANGED(0x%08Xu);\n", in.pc + 2);
+                    if (n + 1 == b.insns.size()) {
+                        x.o.f("  c->pc = 0x%08Xu;\n", b.end);
+                        jump(x, b.end);
+                    }
+                }
+                if (b.insns.empty()) x.o.f("  return 1;\n");
+            }
+            x.o.f("}\n\n");
+            body += x.o.s;
+            out.rom_code.insert(out.rom_code.end(), x.rom_code.begin(), x.rom_code.end());
+            out.folded_literals += x.folded;
+            out.fast_loops += x.fast_loops;
+            ++out.functions;
+            // Merge validation ranges.
+            std::sort(x.ranges.begin(), x.ranges.end());
+            std::vector<std::pair<uint32_t, uint32_t>> merged;
+            for (auto r : x.ranges) {
+                if (!merged.empty() && r.first <= merged.back().first + merged.back().second) {
+                    uint32_t end = std::max(merged.back().first + merged.back().second, r.first + r.second);
+                    merged.back().second = end - merged.back().first;
+                } else merged.push_back(r);
+            }
+            // Leave the patched immediates out.
+            for (uint32_t u : x.unchecked) {
+                for (size_t i = 0; i < merged.size(); ++i) {
+                    const auto r = merged[i];
+                    if (u < r.first || u >= r.first + r.second) continue;
+                    std::vector<std::pair<uint32_t, uint32_t>> parts;
+                    if (u > r.first) parts.push_back({r.first, u - r.first});
+                    if (u + 1 < r.first + r.second) parts.push_back({u + 1, r.first + r.second - u - 1});
+                    merged.erase(merged.begin() + long(i));
+                    merged.insert(merged.begin() + long(i), parts.begin(), parts.end());
+                    break;
+                }
+            }
+            uint32_t begin = uint32_t(out.ranges.size());
+            for (auto r : merged) {
+                int sp = p.space_of(r.first, -1);
+                out.ranges.push_back({r.first, r.second, sp >= 0 ? p.spaces[size_t(sp)].to_rom(r.first) : 0});
+            }
+            fn_ranges[f.entry] = {begin, uint32_t(merged.size())};
+        }
+        body += "} // namespace recomp\n";
+        FILE* fp = std::fopen((opt.out_dir + "/" + fname).c_str(), "w");
+        std::fwrite(body.data(), 1, body.size(), fp);
+        std::fclose(fp);
+        out.files.push_back(fname);
+    }
+    for (const auto& [bk, fk] : owner) {
+        auto r = fn_ranges[fk];
+        const uint32_t fi = uint32_t(std::find(fkeys.begin(), fkeys.end(), fk) - fkeys.begin());
+        out.table.push_back({key_addr(bk), fn_name(Cpu::SH2, fk), r.first, r.second, fi});
+    }
+}
+
+} // namespace o32x::recompiler

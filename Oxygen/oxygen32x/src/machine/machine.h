@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace o32x {
@@ -169,6 +170,30 @@ public:
     CpuExecutors exec;
     FrameStats stats;
 
+    // Self-modification tracking for RAM-resident recompiled SH-2 code.
+    // Ranges are byte offsets into SDRAM / the cache data array.
+    std::vector<std::pair<uint32_t, uint32_t>> sdram_code_ranges, cache_code_ranges;
+    // The same as one bit per byte, made by code_ranges_changed(): a write
+    // checks the bytes it covers instead of every range.
+    std::vector<uint8_t> sdram_code_bits, cache_code_bits;
+    void code_ranges_changed();
+    // Moved on when SDRAM may have changed under the recompiled code as a
+    // whole (a count in sh2_fn_code_writes wraps): every function is checked again.
+    uint32_t sdram_code_epoch = 1;
+    // Moved on by a write that changes a byte of cache-resident code.
+    uint32_t cache_code_epoch[2] = {1, 1};
+    // Writes over SDRAM code, per recompiled function. Each function's
+    // validation ranges in SDRAM ([lo, hi) offsets, `fn` its number) are its
+    // "owners"; a write that changes one of its bytes counts in
+    // sh2_fn_code_writes[fn]. The SH-2 buses point at the counts
+    // (sh2::Bus::code_writes) for the generated code.
+    struct CodeOwner { uint32_t lo, hi, fn; };
+    void set_sdram_code_owners(const std::vector<CodeOwner>& owners, size_t functions);
+    std::vector<uint32_t> sh2_fn_code_writes;
+    // How many further iterations of a polling loop are certain to read from
+    // `a` what they read at cycle count `at` (see recomp_api.h).
+    int32_t sh2_read_stable_to(int cpu, uint32_t a, int size, int32_t at) const;
+
     // Timing
     uint64_t mclk = 0;        // current master clock
     uint64_t m68k_clock = 0;  // 68K cycles executed
@@ -251,6 +276,13 @@ private:
     // machines can run side by side, e.g. for lockstep comparison).
     Sh2BusCtx sh2_ctx_[2] = {};
     SliceInfo m68k_slice_, sh2_slice_[2];
+
+    // The owners (above) by 256-byte chunk of SDRAM: chunk k's are
+    // code_owners_[code_owner_at_[k] .. code_owner_at_[k + 1]).
+    static constexpr int kCodeChunkShift = 8;
+    std::vector<CodeOwner> code_owners_;
+    std::vector<uint32_t> code_owner_at_;
+    void sdram_code_written(uint32_t off, int size);
 };
 
 } // namespace o32x
