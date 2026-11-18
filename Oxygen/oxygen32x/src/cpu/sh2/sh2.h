@@ -1,6 +1,7 @@
 // Hitachi SH-2 (SH7604) CPU model shared by the interpreter and recompiled code.
 #pragma once
 #include <cstdint>
+#include <climits>
 
 namespace sh2 {
 
@@ -42,6 +43,12 @@ struct State {
     uint8_t irq_level;     // pending interrupt level (0 = none)
     uint8_t irq_vector;    // vector number for the pending interrupt
     uint8_t id;            // 0 = master, 1 = slave
+    // Idle-loop detection (interpreter): stores executed, and reads whose value
+    // may change while the CPU runs (device registers, timers).
+    uint32_t wcount = 0, unsafe_reads = 0;
+    // Reads of values that change at known times (the 32X VDP status) set
+    // this to the `cycles` value below which the value read may differ.
+    int32_t stable_floor = INT32_MIN;
     Bus bus;
     // Called when an interrupt is accepted (so the source can be acknowledged).
     void (*irq_ack)(void* user, State* c) = nullptr;
@@ -111,15 +118,18 @@ SH2_ACCESS uint32_t rd32(State* c, uint32_t a) {
     return c->bus.read32(c->bus.user, a);
 }
 SH2_ACCESS void wr8(State* c, uint32_t a, uint32_t v) {
+    ++c->wcount;
     if (uint8_t* p = wr_ptr(c, a)) { p[0] = uint8_t(v); return; }
     c->bus.write8(c->bus.user, a, v & 0xFF);
 }
 SH2_ACCESS void wr16(State* c, uint32_t a, uint32_t v) {
+    ++c->wcount;
     a &= ~1u;
     if (uint8_t* p = wr_ptr(c, a)) { p[0] = uint8_t(v >> 8); p[1] = uint8_t(v); return; }
     c->bus.write16(c->bus.user, a, v & 0xFFFF);
 }
 SH2_ACCESS void wr32(State* c, uint32_t a, uint32_t v) {
+    ++c->wcount;
     a &= ~3u;
     if (uint8_t* p = wr_ptr(c, a)) { p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v); return; }
     c->bus.write32(c->bus.user, a, v);

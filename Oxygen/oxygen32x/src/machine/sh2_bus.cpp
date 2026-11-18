@@ -406,6 +406,27 @@ void Machine::mars_write(int who, uint32_t addr, uint32_t v, int size) {
 // ---------------------------------------------------------------------------
 uint32_t Machine::sh2_read(int cpu, uint32_t a, int size) {
     const uint32_t area = a >> 29;
+    // Reads whose value can change while this CPU runs: the idle-loop
+    // detector must not treat a loop polling them as idle. The 32X VDP status
+    // changes at known times, so it only limits how far a loop may be skipped.
+    if (a >= 0xFFFFFE00) {
+        ++sh2[cpu].unsafe_reads;
+    } else if (area <= 1 && (a & 0x1FFFFFFF) >= 0x4000 && (a & 0x1FFFFFFF) < 0x4400) {
+        const uint32_t off = (a & 0x3FF) & ~1u;
+        if (off == 0x12) {
+            ++sh2[cpu].unsafe_reads;
+        } else if (off == 0x10A) {
+            const int64_t pos = int64_t(sh2_now_mclk(cpu)) - int64_t(line_start_mclk);
+            const int64_t edge = pos < 0 ? 0 : (pos < 2600 ? 2600 : kMclkPerLine);
+            int64_t hc = (edge - pos) * 3 / 7;
+            if (hc < 1) hc = 1;
+            // The value may differ once `cycles` drops to floor_v; keep the earliest such point.
+            int64_t floor_v = int64_t(sh2[cpu].cycles) - hc;
+            if (floor_v <= INT32_MIN) floor_v = int64_t(INT32_MIN) + 1;
+            if (sh2[cpu].stable_floor == INT32_MIN || floor_v > sh2[cpu].stable_floor)
+                sh2[cpu].stable_floor = int32_t(floor_v);
+        }
+    }
     if (area <= 1) {
         uint32_t p = a & 0x1FFFFFFF;
         if (p < 0x4000) return be_read(bios_stub + p, size);
