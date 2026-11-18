@@ -20,10 +20,8 @@ struct Tables {
         }
     }
 };
-const Tables& tables() {
-    static const Tables t;
-    return t;
-}
+const Tables g_tables;  // built once at start-up (no function-local static guard in the hot path)
+inline const Tables& tables() { return g_tables; }
 
 // Detune (phase increment adjustment) by FD (0-3) and key code (0-31).
 const uint8_t kDetune[4][32] = {
@@ -244,9 +242,9 @@ void Ym2612::step_envelopes() {
 }
 
 int Ym2612::op_output(Op& o, int c, int mod, int am) {
-    const Tables& t = tables();
     int level = o.env + (o.tl << 3) + (o.am ? am : 0);
-    if (level > 0x3FF) level = 0x3FF;
+    if (level >= 0x3FF) return 0;  // fully attenuated: the output below is exactly 0
+    const Tables& t = tables();
     uint32_t phase = ((o.phase >> 10) + uint32_t(mod)) & 0x3FF;
     uint32_t q = phase & 0xFF;
     if (phase & 0x100) q ^= 0xFF;
@@ -303,8 +301,12 @@ void Ym2612::generate(int samples, std::vector<int16_t>& out) {
             Ch& ch = ch_[c];
             int am = kAmShift[ch.ams] >= 8 ? 0 : (am_val >> kAmShift[ch.ams]);
             // Phase advance (with PM applied as a scaled increment).
-            double pm = (lfo_en_ && ch.pms) ? std::pow(2.0, kPmCents[ch.pms] * pm_tri / 1200.0) : 1.0;
-            for (auto& op : ch.op) op.phase = (op.phase + uint32_t(op.inc * pm)) & 0xFFFFF;
+            if (lfo_en_ && ch.pms) {
+                const double pm = std::pow(2.0, kPmCents[ch.pms] * pm_tri / 1200.0);
+                for (auto& op : ch.op) op.phase = (op.phase + uint32_t(op.inc * pm)) & 0xFFFFF;
+            } else {
+                for (auto& op : ch.op) op.phase = (op.phase + uint32_t(op.inc)) & 0xFFFFF;
+            }
             int32_t fbmod = ch.fb ? (ch.fb_mem[0] + ch.fb_mem[1]) >> (10 - ch.fb) : 0;
             int32_t o1 = op_output(ch.op[0], c, fbmod, am);
             ch.fb_mem[0] = ch.fb_mem[1];

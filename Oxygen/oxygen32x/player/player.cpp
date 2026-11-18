@@ -246,6 +246,7 @@ int main(int argc, char** argv) {
     bool quit = false;
     int frames = 0;
     int fps_frames = 0;
+    int skipped = 0;
     double fps_value = 0, ms_value = 0;
     double run_ms_acc = 0;
     Uint64 fps_t0 = SDL_GetPerformanceCounter();
@@ -320,12 +321,20 @@ int main(int argc, char** argv) {
             } else {
                 machine->audio_out.clear();
             }
-            render_frame(*machine, *frame);
-            void* px; int pitch;
-            if (SDL_LockTexture(tex, nullptr, &px, &pitch) == 0) {
-                for (int y = 0; y < frame->height; ++y)
-                    std::memcpy(static_cast<uint8_t*>(px) + y * pitch, frame->pixels + y * kFrameWidth, kFrameWidth * 4);
-                SDL_UnlockTexture(tex);
+            // When the sound queue is running dry the machine is too slow: skip
+            // drawing this picture (never more than two in a row) to catch up.
+            const bool behind = adev && int(SDL_GetQueuedAudioSize(adev)) < bytes_per_sec / 60;
+            if (behind && skipped < 2) {
+                ++skipped;
+            } else {
+                skipped = 0;
+                render_frame(*machine, *frame);
+                void* px; int pitch;
+                if (SDL_LockTexture(tex, nullptr, &px, &pitch) == 0) {
+                    for (int y = 0; y < frame->height; ++y)
+                        std::memcpy(static_cast<uint8_t*>(px) + y * pitch, frame->pixels + y * kFrameWidth, kFrameWidth * 4);
+                    SDL_UnlockTexture(tex);
+                }
             }
         }
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);

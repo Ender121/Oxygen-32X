@@ -80,10 +80,19 @@ uint32_t blend_half(uint32_t rgb) { return 0xFF000000u | ((rgb & 0xFEFEFE) >> 1)
 
 // Resolves one MD line. `top` gets the winning palette index (bit 6: backdrop);
 // `rgb` the final colour, with shadow/highlight applied.
+namespace {
+void render_md_line_pal(const Vdp& v, int line, const uint32_t* pal, uint32_t* rgbout, uint8_t* top);
+}
+
 void render_md_line(const Vdp& v, int line, uint32_t* rgbout, uint8_t* top) {
-    const int width = v.width();
     uint32_t pal[64];
     for (int i = 0; i < 64; ++i) pal[i] = Vdp::cram_to_rgb(v.cram[i]) | 0xFF000000u;
+    render_md_line_pal(v, line, pal, rgbout, top);
+}
+
+namespace {
+void render_md_line_pal(const Vdp& v, int line, const uint32_t* pal, uint32_t* rgbout, uint8_t* top) {
+    const int width = v.width();
     const uint8_t bgidx = v.reg[7] & 0x3F;
     if (!v.display_enabled()) {
         for (int x = 0; x < width; ++x) { top[x] = bgidx | 0x40; rgbout[x] = pal[bgidx]; }
@@ -195,6 +204,7 @@ void render_md_line(const Vdp& v, int line, uint32_t* rgbout, uint8_t* top) {
         top[x] = isbg ? uint8_t(c | 0x40) : c;
     }
 }
+} // namespace
 
 namespace {
 inline uint32_t rgb555(uint16_t c) {
@@ -215,39 +225,62 @@ void render_frame(const Machine& m, Frame& out) {
     const bool pri = (mars.bitmap_mode & 0x80) != 0;
     const uint8_t* fb = mars.fb[mars.fb_display];
 
+    uint32_t mdpal[64];
+    for (int i = 0; i < 64; ++i) mdpal[i] = Vdp::cram_to_rgb(v.cram[i]) | 0xFF000000u;
+    uint32_t pal32[256];  // 32X palette as XRGB, with bit 15 kept apart
+    uint8_t thr32[256];
+    for (int i = 0; i < 256; ++i) { pal32[i] = rgb555(mars.pal[i]); thr32[i] = (mars.pal[i] & 0x8000) != 0; }
+
     uint32_t mdrgb[kMaxW];
     uint8_t mdtop[kMaxW];
+    uint32_t l32[kFrameWidth];
+    bool wins[kFrameWidth];  // the 32X pixel is shown regardless of the Mega Drive
     for (int ln = 0; ln < out.height; ++ln) {
-        render_md_line(v, ln, mdrgb, mdtop);
         uint32_t* dst = out.pixels + ln * kFrameWidth;
-        // MD layer (H32 stretched to 320).
+        bool need_md = true;
+        if (show32) {
+            const int lt = ln >= 224 ? 223 : ln;
+            const uint32_t lineaddr = (uint32_t(fb[lt * 2]) << 8) | fb[lt * 2 + 1];
+            const uint32_t base = (lineaddr * 2) & 0x1FFFF;
+            uint32_t rle_o = base;
+            int rle_left = 0;
+            uint16_t rle_px = 0;
+            bool all = true;
+            for (int x = 0; x < kFrameWidth; ++x) {
+                uint32_t rgb;
+                bool through;
+                if (mode == 1) {
+                    const uint8_t idx = fb[(base + (mars.screen_shift & 1) + uint32_t(x)) & 0x1FFFF];
+                    rgb = pal32[idx]; through = thr32[idx] != 0;
+                } else if (mode == 2) {
+                    const uint32_t o = (base + uint32_t(x) * 2) & 0x1FFFF;
+                    const uint16_t c = uint16_t((fb[o] << 8) | fb[o + 1]);
+                    rgb = rgb555(c); through = (c & 0x8000) != 0;
+                } else {
+                    if (rle_left == 0) {
+                        rle_left = fb[rle_o & 0x1FFFF] + 1;
+                        rle_px = mars.pal[fb[(rle_o + 1) & 0x1FFFF]];
+                        rle_o += 2;
+                    }
+                    --rle_left;
+                    rgb = rgb555(rle_px); through = (rle_px & 0x8000) != 0;
+                }
+                l32[x] = rgb;
+                wins[x] = through != pri;
+                all = all && wins[x];
+            }
+            if (all) {  // the 32X covers the whole line: no need to draw the Mega Drive
+                std::memcpy(dst, l32, sizeof l32);
+                need_md = false;
+            }
+        }
+        if (!need_md) continue;
+        render_md_line_pal(v, ln, mdpal, mdrgb, mdtop);
         for (int x = 0; x < kFrameWidth; ++x) dst[x] = mdrgb[mdw == 320 ? x : x * 256 / 320];
         if (!show32) continue;
-        const int lt = ln >= 224 ? 223 : ln;
-        const uint32_t lineaddr = (uint32_t(fb[lt * 2]) << 8) | fb[lt * 2 + 1];
-        const uint32_t base = (lineaddr * 2) & 0x1FFFF;
-        uint32_t rle_o = base;
-        int rle_left = 0;
-        uint16_t rle_px = 0;
         for (int x = 0; x < kFrameWidth; ++x) {
-            uint16_t c;
-            if (mode == 1) {
-                c = mars.pal[fb[(base + (mars.screen_shift & 1) + uint32_t(x)) & 0x1FFFF]];
-            } else if (mode == 2) {
-                const uint32_t o = (base + uint32_t(x) * 2) & 0x1FFFF;
-                c = uint16_t((fb[o] << 8) | fb[o + 1]);
-            } else {
-                if (rle_left == 0) {
-                    rle_left = fb[rle_o & 0x1FFFF] + 1;
-                    rle_px = mars.pal[fb[(rle_o + 1) & 0x1FFFF]];
-                    rle_o += 2;
-                }
-                --rle_left;
-                c = rle_px;
-            }
-            const bool through = (c & 0x8000) != 0;
             const bool md_backdrop = (mdtop[mdw == 320 ? x : x * 256 / 320] & 0x40) != 0;
-            if (through != pri || md_backdrop) dst[x] = rgb555(c);
+            if (wins[x] || md_backdrop) dst[x] = l32[x];
         }
     }
 }
