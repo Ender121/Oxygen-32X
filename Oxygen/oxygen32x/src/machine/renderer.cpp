@@ -2,6 +2,7 @@
 #include "machine/renderer.h"
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
 namespace o32x {
 
@@ -214,16 +215,32 @@ inline uint32_t rgb555(uint16_t c) {
 }
 } // namespace
 
+void snapshot_render_state(const Machine& m, RenderState& out) {
+    out.vdp = m.vdp;
+    out.bitmap_mode = m.mars.bitmap_mode;
+    out.screen_shift = m.mars.screen_shift;
+    out.adapter_ctrl = m.mars.adapter_ctrl;
+    std::memcpy(out.pal, m.mars.pal, sizeof out.pal);
+    out.has_fb = (m.mars.bitmap_mode & 3) != 0 && (m.mars.adapter_ctrl & 1);
+    if (out.has_fb) std::memcpy(out.fb, m.mars.fb[m.mars.fb_display], sizeof out.fb);
+}
+
 void render_frame(const Machine& m, Frame& out) {
-    const Vdp& v = m.vdp;
+    auto rs = std::make_unique<RenderState>();
+    snapshot_render_state(m, *rs);
+    render_state(*rs, out);
+}
+
+void render_state(const RenderState& rs, Frame& out) {
+    const Vdp& v = rs.vdp;
     const int mdw = v.width();
     out.width = kFrameWidth;
     out.height = v.height();
-    const Mars& mars = m.mars;
+    struct { uint16_t bitmap_mode, screen_shift, adapter_ctrl; const uint16_t* pal; } mars{rs.bitmap_mode, rs.screen_shift, rs.adapter_ctrl, rs.pal};
     const int mode = mars.bitmap_mode & 3;
-    const bool show32 = mode != 0 && (mars.adapter_ctrl & 1);
+    const bool show32 = rs.has_fb;
     const bool pri = (mars.bitmap_mode & 0x80) != 0;
-    const uint8_t* fb = mars.fb[mars.fb_display];
+    const uint8_t* fb = rs.fb;
 
     uint32_t mdpal[64];
     for (int i = 0; i < 64; ++i) mdpal[i] = Vdp::cram_to_rgb(v.cram[i]) | 0xFF000000u;

@@ -17,6 +17,18 @@ struct Frame {
     uint32_t pixels[kFrameWidth * kFrameMaxHeight];  // XRGB8888 (alpha 0xFF)
 };
 
+// Everything the renderer reads, copied out of the machine: a picture can be
+// drawn from this on another thread while the machine runs on.
+struct RenderState {
+    Vdp vdp;
+    uint16_t bitmap_mode = 0, screen_shift = 0, adapter_ctrl = 0;
+    uint16_t pal[256];
+    uint8_t fb[0x20000];  // the displayed 32X frame buffer (not copied when unused)
+    bool has_fb = false;
+};
+void snapshot_render_state(const Machine& m, RenderState& out);
+void render_state(const RenderState& s, Frame& out);
+
 // Renders the picture the machine shows right now.
 void render_frame(const Machine& m, Frame& out);
 

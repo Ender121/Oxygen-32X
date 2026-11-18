@@ -12,7 +12,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -246,6 +250,29 @@ int main(int argc, char** argv) {
     std::map<SDL_FingerID, SDL_FPoint> fingers;
     bool touch_used = false;
     auto frame = std::make_unique<Frame>();
+    // The picture is drawn on a worker thread from a copy of the machine state
+    // (renderer.h RenderState), overlapping the next emulated frame.
+    // job: 0 idle, 1 requested, 2 done (the frame is ready to upload), 3 quit.
+    auto rstate = std::make_unique<RenderState>();
+    auto wframe = std::make_unique<Frame>();
+    std::atomic<int> job{0};
+    std::mutex jm;
+    std::condition_variable jcv;
+    std::atomic<double> worker_ms{0};
+    std::thread worker([&] {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(jm);
+                jcv.wait(lk, [&] { return job.load() == 1 || job.load() == 3; });
+                if (job.load() == 3) return;
+            }
+            const Uint64 t = SDL_GetPerformanceCounter();
+            render_state(*rstate, *wframe);
+            worker_ms = double(SDL_GetPerformanceCounter() - t) * 1000.0 / double(SDL_GetPerformanceFrequency());
+            std::lock_guard<std::mutex> lk(jm);
+            job = 2;
+        }
+    });
     bool quit = false;
     int frames = 0;
     int fps_frames = 0;
@@ -334,15 +361,27 @@ int main(int argc, char** argv) {
             } else {
                 skipped = 0;
                 const Uint64 t_r = SDL_GetPerformanceCounter();
-                render_frame(*machine, *frame);
-                void* px; int pitch;
-                if (SDL_LockTexture(tex, nullptr, &px, &pitch) == 0) {
-                    for (int y = 0; y < frame->height; ++y)
-                        std::memcpy(static_cast<uint8_t*>(px) + y * pitch, frame->pixels + y * kFrameWidth, kFrameWidth * 4);
-                    SDL_UnlockTexture(tex);
+                // Hand the machine state to the worker if it is free (otherwise this
+                // picture is dropped; emulation never waits for drawing).
+                if (job.load() == 0) {
+                    snapshot_render_state(*machine, *rstate);
+                    { std::lock_guard<std::mutex> lk(jm); job = 1; }
+                    jcv.notify_one();
                 }
                 rend_ms_acc += ms_since(t_r);
             }
+        }
+        if (job.load() == 2) {
+            const Uint64 t_u = SDL_GetPerformanceCounter();
+            void* px; int pitch;
+            if (SDL_LockTexture(tex, nullptr, &px, &pitch) == 0) {
+                for (int y = 0; y < wframe->height; ++y)
+                    std::memcpy(static_cast<uint8_t*>(px) + y * pitch, wframe->pixels + y * kFrameWidth, kFrameWidth * 4);
+                SDL_UnlockTexture(tex);
+            }
+            frame->height = wframe->height;
+            job = 0;
+            rend_ms_acc += ms_since(t_u);
         }
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
@@ -400,6 +439,9 @@ int main(int argc, char** argv) {
         }
         if (max_frames >= 0 && frames >= max_frames) quit = true;
     }
+    { std::lock_guard<std::mutex> lk(jm); job = 3; }
+    jcv.notify_one();
+    worker.join();
     if (!shot_path.empty()) {
         render_frame(*machine, *frame);
         SDL_Surface* s = SDL_CreateRGBSurfaceFrom(frame->pixels, frame->width, frame->height, 32, kFrameWidth * 4,
