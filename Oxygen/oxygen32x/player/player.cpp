@@ -33,11 +33,11 @@ struct Layout {
     bool touch_visible;
 };
 
-Layout make_layout(int w, int h) {
+Layout make_layout(int w, int h, int fw) {
     Layout L{};
     const bool portrait = h > w;
     if (portrait) {
-        const int gh = w * 224 / 320;
+        const int gh = w * 224 / fw;
         L.game = {0, 0, w, gh};
         const float area_top = float(gh), area_h = float(h - gh);
         L.r = std::min(w * 0.08f, area_h * 0.12f);
@@ -50,9 +50,9 @@ Layout make_layout(int w, int h) {
         L.start_x = w * 0.5f;
         L.start_y = area_top + area_h * 0.9f;
     } else {
-        int gw = h * 320 / 224;
+        int gw = h * fw / 224;
         if (gw > w) gw = w;
-        L.game = {(w - gw) / 2, (h - gw * 224 / 320) / 2, gw, gw * 224 / 320};
+        L.game = {(w - gw) / 2, (h - gw * 224 / fw) / 2, gw, gw * 224 / fw};
         L.r = h * 0.075f;
         L.dpad_r = L.r * 2.3f;
         L.dpad_x = L.dpad_r + w * 0.02f;
@@ -190,6 +190,7 @@ int main(int argc, char** argv) {
     bool show_fps = false;
 #endif
     int win_w = 960, win_h = 672;
+    int widescreen = 0;  // extra Mega Drive pixels on each side of the 320 pixel picture
     std::string win_shot;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -197,6 +198,7 @@ int main(int argc, char** argv) {
         else if (a == "--shot" && i + 1 < argc) shot_path = argv[++i];
         else if (a == "--press" && i + 1 < argc) forced_pad = uint16_t(std::strtol(argv[++i], nullptr, 0));
         else if (a == "--fps") show_fps = true;
+        else if (a == "--widescreen" && i + 1 < argc) widescreen = std::atoi(argv[++i]);
         else if (a == "--touch-ui") force_touch_ui = true;
         else if (a == "--size" && i + 1 < argc) std::sscanf(argv[++i], "%dx%d", &win_w, &win_h);
         else if (a == "--window-shot" && i + 1 < argc) win_shot = argv[++i];
@@ -233,7 +235,7 @@ int main(int argc, char** argv) {
     if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     if (!ren) { std::fprintf(stderr, "renderer: %s\n", SDL_GetError()); return 1; }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
-    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kFrameWidth, kFrameMaxHeight);
+    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kFrameMaxWidth, kFrameMaxHeight);
 
     // Audio: the machine makes interleaved stereo S16 at ~53.27 kHz; SDL resamples.
     SDL_AudioSpec want{}, have{};
@@ -254,6 +256,7 @@ int main(int argc, char** argv) {
     // (renderer.h RenderState), overlapping the next emulated frame.
     // job: 0 idle, 1 requested, 2 done (the frame is ready to upload), 3 quit.
     auto rstate = std::make_unique<RenderState>();
+    rstate->margin = widescreen;
     auto wframe = std::make_unique<Frame>();
     std::atomic<int> job{0};
     std::mutex jm;
@@ -322,7 +325,7 @@ int main(int argc, char** argv) {
         }
         int ww, wh;
         SDL_GetRendererOutputSize(ren, &ww, &wh);
-        const Layout L = make_layout(ww, wh);
+        const Layout L = make_layout(ww, wh, frame->width);
         uint16_t pad = pad_from_keyboard() | forced_pad;
         for (auto* c : pads) pad |= pad_from_controller(c);
         const uint16_t touch_pad = pad_from_touch(L, fingers, ww, wh);
@@ -376,16 +379,17 @@ int main(int argc, char** argv) {
             void* px; int pitch;
             if (SDL_LockTexture(tex, nullptr, &px, &pitch) == 0) {
                 for (int y = 0; y < wframe->height; ++y)
-                    std::memcpy(static_cast<uint8_t*>(px) + y * pitch, wframe->pixels + y * kFrameWidth, kFrameWidth * 4);
+                    std::memcpy(static_cast<uint8_t*>(px) + y * pitch, wframe->pixels + y * wframe->width, wframe->width * 4);
                 SDL_UnlockTexture(tex);
             }
             frame->height = wframe->height;
+            frame->width = wframe->width;
             job = 0;
             rend_ms_acc += ms_since(t_u);
         }
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
-        SDL_Rect src{0, 0, kFrameWidth, frame->height};
+        SDL_Rect src{0, 0, frame->width, frame->height};
         SDL_RenderCopy(ren, tex, &src, &L.game);
         {
             const Uint64 now = SDL_GetPerformanceCounter();
@@ -443,8 +447,9 @@ int main(int argc, char** argv) {
     jcv.notify_one();
     worker.join();
     if (!shot_path.empty()) {
-        render_frame(*machine, *frame);
-        SDL_Surface* s = SDL_CreateRGBSurfaceFrom(frame->pixels, frame->width, frame->height, 32, kFrameWidth * 4,
+        snapshot_render_state(*machine, *rstate);
+        render_state(*rstate, *frame);
+        SDL_Surface* s = SDL_CreateRGBSurfaceFrom(frame->pixels, frame->width, frame->height, 32, frame->width * 4,
                                                   0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
         SDL_SaveBMP(s, shot_path.c_str());
         SDL_FreeSurface(s);

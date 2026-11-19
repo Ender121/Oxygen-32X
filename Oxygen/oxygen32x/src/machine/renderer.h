@@ -10,11 +10,13 @@ namespace o32x {
 
 constexpr int kFrameWidth = 320;
 constexpr int kFrameMaxHeight = 240;
+// Widescreen: up to this many pixels across (the 32X picture stays 320 wide, centred).
+constexpr int kFrameMaxWidth = 480;
 
 struct Frame {
     int width = kFrameWidth;
     int height = 224;
-    uint32_t pixels[kFrameWidth * kFrameMaxHeight];  // XRGB8888 (alpha 0xFF)
+    uint32_t pixels[kFrameMaxWidth * kFrameMaxHeight];  // XRGB8888 (alpha 0xFF), rows of `width`
 };
 
 // Everything the renderer reads, copied out of the machine: a picture can be
@@ -25,6 +27,7 @@ struct RenderState {
     uint16_t pal[256];
     uint8_t fb[0x20000];  // the displayed 32X frame buffer (not copied when unused)
     bool has_fb = false;
+    int margin = 0;  // widescreen: Mega Drive pixels added on each side
 };
 void snapshot_render_state(const Machine& m, RenderState& out);
 void render_state(const RenderState& s, Frame& out);
