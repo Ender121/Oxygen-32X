@@ -46,21 +46,40 @@ void render_plane(const Vdp& v, int line, bool planeA, LinePix* out, int win_x0,
     const int hscroll = rd16(v.vram, hs_addr) & 0x3FF;
     const bool col_vs = (v.reg[11] & 4) != 0;
     const int lane = planeA ? 0 : 1;
-    for (int x = 0; x < width; ++x) {
-        if (planeA && x >= win_x0 && x < win_x1) continue;
-        if (x < blank) { out[x] = mk(0, 0); continue; }  // before the start of the level
+    const bool has_win = planeA && win_x1 > win_x0;
+    for (int x = 0; x < width;) {
+        if (has_win && x >= win_x0 && x < win_x1) { x = win_x1; continue; }
+        if (x < blank) {
+            const int e2 = std::min(blank, width);
+            for (; x < e2; ++x) {
+                if (has_win && x >= win_x0 && x < win_x1) break;
+                out[x] = mk(0, 0);
+            }
+            continue;
+        }
         const int wx = x - margin;
         const int col = std::min(std::max(wx >> 4, 0), 19);
         const int vs = v.vsram[col_vs ? col * 2 + lane : lane];
         const int py = (line + vs) & (ph * 8 - 1);
-        const int px = (wx - hscroll) & (pw * 8 - 1);
-        const uint32_t ea = nt + uint32_t(((py >> 3) * pw + (px >> 3)) * 2);
+        const int px0 = (wx - hscroll) & (pw * 8 - 1);
+        const uint32_t ea = nt + uint32_t(((py >> 3) * pw + (px0 >> 3)) * 2);
         const uint16_t e = rd16(v.vram, ea);
-        int tx = px & 7, ty = py & 7;
-        if (e & 0x0800) tx = 7 - tx;
+        int run = 8 - (px0 & 7);
+        if (col_vs) run = std::min(run, 16 - (wx & 15));
+        if (has_win && x < win_x0) run = std::min(run, win_x0 - x);
+        run = std::min(run, width - x);
+        int ty = py & 7;
         if (e & 0x1000) ty = 7 - ty;
-        const uint8_t c = tile_px(v.vram, e, tx, ty);
-        out[x] = mk(c ? ((e >> 9) & 0x30) | c : 0, (e >> 15) & 1);
+        const uint32_t base = ((e & 0x7FF) << 5) + uint32_t(ty) * 4;
+        const unsigned pal = (e >> 9) & 0x30, pr = (e >> 15) & 1;
+        for (int k = 0; k < run; ++k) {
+            int tx = (px0 + k) & 7;
+            if (e & 0x0800) tx = 7 - tx;
+            const uint8_t bb = v.vram[(base + uint32_t(tx >> 1)) & 0xFFFF];
+            const uint8_t c = (tx & 1) ? (bb & 15) : (bb >> 4);
+            out[x + k] = mk(c ? pal | c : 0, pr);
+        }
+        x += run;
     }
 }
 
