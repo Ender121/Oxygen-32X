@@ -28,6 +28,7 @@ struct RenderState {
     uint8_t fb[0x20000];  // the displayed 32X frame buffer (not copied when unused)
     bool has_fb = false;
     int margin = 0;  // widescreen: Mega Drive pixels added on each side
+    int blank_left[2] = {0, 0};  // plane A, B: pixels (from the left edge of the widened picture) before the level's start
 };
 void snapshot_render_state(const Machine& m, RenderState& out);
 void render_state(const RenderState& s, Frame& out);

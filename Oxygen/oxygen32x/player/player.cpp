@@ -4,6 +4,7 @@
 // On Android the ROM is read from <internal storage>/rom.32x.
 #include "machine/machine.h"
 #include "game/recomp_dispatch.h"
+#include "game/widescreen.h"
 #include "machine/renderer.h"
 #include <SDL.h>
 #include <algorithm>
@@ -225,7 +226,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     machine->reset();
-    { auto rs = install_recompiled_code(*machine, !std::getenv("O32X_NO_RECOMP")); SDL_Log("exec: %s", rs.description.c_str()); }
+    { auto rs = install_recompiled_code(*machine, !std::getenv("O32X_NO_RECOMP")); SDL_Log("exec: %s", rs.description.c_str()); install_widescreen(*machine, widescreen); }
     machine->audio_enabled = true;
 
     SDL_Window* win = SDL_CreateWindow("Oxygen-32X", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h,
@@ -256,7 +257,6 @@ int main(int argc, char** argv) {
     // (renderer.h RenderState), overlapping the next emulated frame.
     // job: 0 idle, 1 requested, 2 done (the frame is ready to upload), 3 quit.
     auto rstate = std::make_unique<RenderState>();
-    rstate->margin = widescreen;
     auto wframe = std::make_unique<Frame>();
     std::atomic<int> job{0};
     std::mutex jm;
@@ -368,6 +368,7 @@ int main(int argc, char** argv) {
                 // picture is dropped; emulation never waits for drawing).
                 if (job.load() == 0) {
                     snapshot_render_state(*machine, *rstate);
+                    widescreen_prepare_render(*rstate);
                     { std::lock_guard<std::mutex> lk(jm); job = 1; }
                     jcv.notify_one();
                 }
@@ -448,6 +449,7 @@ int main(int argc, char** argv) {
     worker.join();
     if (!shot_path.empty()) {
         snapshot_render_state(*machine, *rstate);
+        widescreen_prepare_render(*rstate);
         render_state(*rstate, *frame);
         SDL_Surface* s = SDL_CreateRGBSurfaceFrom(frame->pixels, frame->width, frame->height, 32, frame->width * 4,
                                                   0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);

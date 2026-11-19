@@ -28,7 +28,7 @@ inline uint16_t rd16(const uint8_t* vram, uint32_t a) {
 
 // `margin` extra pixels are drawn on each side of the Mega Drive picture (widescreen):
 // `out` is indexed from the left margin, the scroll registers act on x - margin.
-void render_plane(const Vdp& v, int line, bool planeA, LinePix* out, int win_x0, int win_x1, int margin) {
+void render_plane(const Vdp& v, int line, bool planeA, LinePix* out, int win_x0, int win_x1, int margin, int blank) {
     static const int sizes[4] = {32, 64, 32, 128};
     const int width = v.width() + 2 * margin;
     const int pw = sizes[v.reg[16] & 3];
@@ -48,6 +48,7 @@ void render_plane(const Vdp& v, int line, bool planeA, LinePix* out, int win_x0,
     const int lane = planeA ? 0 : 1;
     for (int x = 0; x < width; ++x) {
         if (planeA && x >= win_x0 && x < win_x1) continue;
+        if (x < blank) { out[x] = mk(0, 0); continue; }  // before the start of the level
         const int wx = x - margin;
         const int col = std::min(std::max(wx >> 4, 0), 19);
         const int vs = v.vsram[col_vs ? col * 2 + lane : lane];
@@ -86,7 +87,7 @@ uint32_t blend_half(uint32_t rgb) { return 0xFF000000u | ((rgb & 0xFEFEFE) >> 1)
 // Resolves one MD line. `top` gets the winning palette index (bit 6: backdrop);
 // `rgb` the final colour, with shadow/highlight applied.
 namespace {
-void render_md_line_pal(const Vdp& v, int line, const uint32_t* pal, uint32_t* rgbout, uint8_t* top, int margin);
+void render_md_line_pal(const Vdp& v, int line, const uint32_t* pal, uint32_t* rgbout, uint8_t* top, int margin, const int* blank = nullptr);
 }
 
 void render_md_line(const Vdp& v, int line, uint32_t* rgbout, uint8_t* top) {
@@ -96,7 +97,7 @@ void render_md_line(const Vdp& v, int line, uint32_t* rgbout, uint8_t* top) {
 }
 
 namespace {
-void render_md_line_pal(const Vdp& v, int line, const uint32_t* pal, uint32_t* rgbout, uint8_t* top, int margin) {
+void render_md_line_pal(const Vdp& v, int line, const uint32_t* pal, uint32_t* rgbout, uint8_t* top, int margin, const int* blank) {
     const int mdwidth = v.width();
     const int width = mdwidth + 2 * margin;
     const uint8_t bgidx = v.reg[7] & 0x3F;
@@ -119,12 +120,12 @@ void render_md_line_pal(const Vdp& v, int line, const uint32_t* pal, uint32_t* r
             int whp = (v.reg[17] & 0x1F) * 16;
             if (whp > mdwidth) whp = mdwidth;
             // The window is anchored to its screen edge: it grows into the margin there.
-            if (v.reg[17] & 0x80) { win_x0 = whp + margin; win_x1 = width; }
-            else { win_x0 = 0; win_x1 = whp + margin; }
+            if (v.reg[17] & 0x80) { if (whp < mdwidth) { win_x0 = whp + margin; win_x1 = width; } }
+            else if (whp > 0) { win_x0 = 0; win_x1 = whp + margin; }
         }
     }
-    render_plane(v, line, false, b, 0, 0, margin);
-    render_plane(v, line, true, a, win_x0, win_x1, margin);
+    render_plane(v, line, false, b, 0, 0, margin, blank ? blank[1] : 0);
+    render_plane(v, line, true, a, win_x0, win_x1, margin, blank ? blank[0] : 0);
     if (win_x1 > win_x0) render_window(v, line, a, win_x0, win_x1, margin);
 
     // Sprites
@@ -148,6 +149,8 @@ void render_md_line_pal(const Vdp& v, int line, const uint32_t* pal, uint32_t* r
                 if (++on_line > max_per_line) break;
                 if (sxr == 0) { if (nonzero_x_seen) masked = true; }
                 else nonzero_x_seen = true;
+                // Sprites the game parked fully outside the original screen stay hidden in the margins.
+                { const int ox = sxr - 128; if (margin && (ox + hs * 8 <= 0 || ox >= mdwidth)) { link = p[3] & 0x7F; ++count; if (link == 0 || link >= max_sprites) break; continue; } }
                 const int sx = sxr - 128 + margin;
                 int row = line - sy;
                 if (pat & 0x1000) row = vsz * 8 - 1 - row;
@@ -303,7 +306,7 @@ void render_state(const RenderState& rs, Frame& out) {
             }
         }
         if (!need_md) continue;
-        render_md_line_pal(v, ln, mdpal, mdrgb, mdtop, margin);
+        render_md_line_pal(v, ln, mdpal, mdrgb, mdtop, margin, rs.blank_left);
         for (int x = 0; x < W; ++x) dst[x] = mdrgb[mdw == 320 ? x : x * 256 / 320];
         if (!show32) continue;
         for (int x = 0; x < W; ++x) {
