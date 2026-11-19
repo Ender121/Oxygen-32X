@@ -191,7 +191,11 @@ int main(int argc, char** argv) {
     bool show_fps = false;
 #endif
     int win_w = 960, win_h = 672;
-    int widescreen = 0;  // extra Mega Drive pixels on each side of the 320 pixel picture
+#ifdef __ANDROID__
+    int widescreen = 48;  // phones are ~16:9: 416x224 fills the screen (--widescreen 0 for the original 320)
+#else
+    int widescreen = 0;   // extra Mega Drive pixels on each side of the 320 pixel picture
+#endif
     std::string win_shot;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
